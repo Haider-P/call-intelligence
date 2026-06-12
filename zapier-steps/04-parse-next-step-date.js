@@ -23,7 +23,8 @@ if (!nextStepDate) {
 
 try {
   // Parse YYYY-MM-DD and convert to milliseconds for HubSpot
-  const date = new Date(nextStepDate + "T00:00:00.000Z");
+  // Use noon UTC to avoid off-by-one day in US timezones (UTC midnight = previous day locally)
+  const date = new Date(nextStepDate + "T12:00:00.000Z");
 
   if (isNaN(date.getTime())) {
     return {
