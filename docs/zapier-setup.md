@@ -9,11 +9,8 @@ Step-by-step instructions for building the Apollo → HubSpot call intelligence 
 Before building:
 - [ ] Apollo API key (Settings → API in Apollo)
 - [ ] Anthropic API key (console.anthropic.com)
-- [ ] HubSpot Private App Token with scopes: `crm.objects.deals.write`, `crm.objects.contacts.read`, `crm.objects.notes.write`, `crm.objects.deals.read`
-- [ ] Create custom HubSpot deal properties (if they don't exist):
-  - **Next Steps** — type: Single-line text, internal name: `next_steps`
-  - **Next Step Date** — type: Date picker, internal name: `next_step_date`
-  - To create: HubSpot → Settings → Properties → Deals → Create property
+- [ ] HubSpot Private App Token with scopes: `crm.objects.deals.write`, `crm.objects.contacts.read`, `crm.objects.notes.write`
+- [ ] Confirm HubSpot deal has `Next Steps` and `Next Step Date` properties
 
 ---
 
@@ -28,7 +25,7 @@ Before building:
 | 5 | Action | Code by Zapier (JS) | Parse next step date |
 | 6 | Action | HubSpot | Find contact by email |
 | 7 | Filter | Zapier Filter | Stop if no contact found |
-| 8 | Action | Code by Zapier (JS) | Find deal by contact ID (HubSpot Search API) |
+| 8 | Action | HubSpot | Find deal associated to contact |
 | 9 | Filter | Zapier Filter | Stop if no deal found |
 | 10 | Action | HubSpot | Create note on deal |
 | 11 | Action | HubSpot | Update deal — Next Steps property |
@@ -115,17 +112,10 @@ Before building:
 
 ---
 
-### Step 8 — Code: Find HubSpot Deal
-> The native HubSpot "Find Deal" action does not support filtering by associated contact ID.
-> Use a Code step with the HubSpot CRM Search API instead.
-
-1. Add **Code by Zapier** → **Run JavaScript**
-2. Input data:
-   - `contactId` → map from Step 6 HubSpot contact ID
-   - `hubspotToken` → paste your HubSpot Private App token (store as secret)
-3. Paste contents of `zapier-steps/05-find-hubspot-deal.js`
-4. Test — confirm `dealId`, `dealName`, and `dealStage` are returned
-5. If multiple deals exist for a contact, the most recently modified one is returned
+### Step 8 — HubSpot: Find Deal
+1. Add **HubSpot** → **Find Deal**
+2. Search by associated contact ID from Step 6
+3. If multiple deals — filter to most recently active
 
 ---
 

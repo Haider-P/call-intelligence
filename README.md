@@ -1,82 +1,132 @@
 # 📞 Call Intelligence — Apollo → HubSpot
 
-Automated pipeline that captures Apollo call transcripts, enriches them with Claude AI, and logs structured intelligence directly into HubSpot deals.
+Automated pipeline that captures Apollo call summaries, enriches them with Claude AI, and builds a compounding intelligence layer on every HubSpot deal — inspired by Granola's approach to meeting memory.
 
 ## What It Does
 
 After every Apollo call:
-1. Apollo webhook fires to Zapier
-2. Transcript is fetched from Apollo API
-3. Claude extracts structured signals (summary, objections, competitors, pricing, sentiment, next steps)
-4. HubSpot deal is updated:
-   - Enriched note created with full brief + transcript
-   - `Next Steps` property updated
-   - `Next Step Date` property updated
-   - Recording link appended
+1. Apollo pushes call summary + transcript to HubSpot deal (native sync)
+2. HubSpot webhook fires to Pipedream
+3. Claude enriches the note with structured signals
+4. The same note is updated in place (no duplicate notes)
+5. Deal properties updated: Next Steps, Next Step Date, Sentiment, Call #, Unresolved Objections
+
+## Granola-Inspired Features
+
+| Feature | What it does |
+|---|---|
+| **Deal memory** | Fetches prior call notes to track continuity across the deal |
+| **Call sequence** | Numbers each call (#1, #2, #3) for momentum context |
+| **Sentiment tracking** | Shows sentiment change call-over-call (🟡 → 🟢 ↑) |
+| **Objection tracking** | Tracks new / resolved / unresolved objections across calls |
+| **Meeting type detection** | Sales, partner, CS, onboarding, internal — different signals per type |
+| **Operational signals** | Flags blockers, escalations, churn risk, expansion opportunities |
+
+## Architecture
+
+```
+Apollo call ends
+        ↓
+Apollo native sync → HubSpot note created on deal
+        ↓
+HubSpot webhook → Pipedream
+        ↓
+Step 1: Parse webhook + fetch prior call history
+        ↓
+Step 2: Claude enrichment (signals + objection tracking + sentiment change)
+        ↓
+Step 3: Update existing HubSpot note (enriched format, one note per call)
+        ↓
+Step 4: Update deal properties (Next Steps, Date, Sentiment, Call #)
+```
+
+## Note Format Output
+
+```
+📞 Sales Call #3 — June 12, 2026
+Duration: 26m 55s | Sentiment: 🟢 positive
+Sentiment change: neutral → positive ↑
+Participants: Matt Shubert, Keith Kilpatrick
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Summary:
+Prospect confirmed budget and wants to start POC in July.
+CFO intro scheduled for next week. Competitor concern addressed.
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Key Signals:
+• Competitors: Visa data solution (evaluating)
+• Pricing: $50-75k annually, board sign-off needed
+• Next Steps: Send proposal by Friday, CFO intro call June 17
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Objections:
+• 🆕 New: Board approval required
+• ✅ Resolved: Implementation timeline concern
+• ⚠️ Still open: CFO sign-off
+
+⚡ Operational Signals:
+CFO intro required before commitment — flag for manager
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+🎙 Recording: https://app.apollo.io/...
+
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+Full Transcript:
+[full transcript]
+```
 
 ## Stack
 
 | Layer | Tool |
 |---|---|
-| Trigger | Apollo webhook (call completed) |
-| Orchestration | Zapier |
-| AI Extraction | Claude API (claude-sonnet-4-6) |
+| Call recording + summary | Apollo (native) |
+| CRM sync trigger | Apollo → HubSpot native sync |
+| Automation | Pipedream |
+| AI enrichment | Claude API (claude-sonnet-4-6) |
 | CRM | HubSpot (Private App Token) |
 
 ## Repo Structure
 
 ```
 call-intelligence/
-├── zapier-steps/
-│   ├── 01-fetch-transcript.js       # HTTP step: fetch transcript from Apollo API
-│   ├── 02-claude-extraction.js      # Code step: Claude API call + signal extraction
-│   ├── 03-format-note.js            # Code step: format final HubSpot note
-│   └── 04-parse-next-step-date.js   # Code step: parse date from next steps text
+├── pipedream-steps/
+│   ├── 01-parse-hubspot-webhook.js   # Webhook handler + prior call history fetch
+│   ├── 02-claude-enrichment.js       # Claude AI extraction + objection tracking
+│   ├── 03-update-hubspot-note.js     # Update existing note with enriched format
+│   └── 04-update-deal-properties.js  # Update Next Steps, Date, Sentiment, Call #
+├── zapier-steps/                     # Original Zapier steps (deprecated, kept for reference)
 ├── prompts/
-│   └── extraction-prompt.md         # Claude prompt template
+│   └── extraction-prompt.md          # Claude prompt template + tuning guide
 ├── docs/
-│   └── zapier-setup.md              # Step-by-step Zapier build guide
-├── .env.example                     # Required credentials
+│   └── pipedream-setup.md            # Step-by-step Pipedream build guide
+├── .env.example
 └── README.md
 ```
 
-## HubSpot Prerequisites
+## HubSpot Properties Required
 
-Before running this flow, ensure the following exist on your HubSpot Deal object:
-- `Next Steps` — Single-line or multi-line text property
-- `Next Step Date` — Date picker property
+Create these on the Deal object before building:
 
-These should already exist. No new properties required.
+| Property Label | Internal Name | Type |
+|---|---|---|
+| Next Steps | `next_steps` | Multi-line text |
+| Next Step Date | `next_step_date` | Date picker |
+| Last Call Sentiment | `last_call_sentiment` | Dropdown (positive/neutral/at-risk) |
+| Last Call Date | `last_call_date` | Date |
+| Last Call Number | `last_call_number` | Number |
+| Last Call Unresolved Objections | `last_call_unresolved_objections` | Multi-line text |
 
-## Credentials Needed
+## Parking Lot — Phase 2
 
-| Credential | Used In |
+- At-risk deal alerts → Slack channel (connects to Slack↔HubSpot flow)
+- Pre-call briefings — agent pulls all prior signals before scheduled calls
+- Cross-deal pattern analysis — "what objections keep killing deals at pricing stage?"
+- Partner channel updates — post call summaries to Slack Connect channels
+
+## Credentials
+
+| Credential | Where Used |
 |---|---|
-| `APOLLO_API_KEY` | Fetch transcript (Zapier HTTP step) |
-| `ANTHROPIC_API_KEY` | Claude extraction (Zapier Code step) |
-| `HUBSPOT_ACCESS_TOKEN` | Update deal + create note (Zapier HubSpot steps) |
-
-Store all as **Zapier secrets** — never hardcode in steps.
-
-## HubSpot Note Output Format
-
-```
-📞 Call Summary — {date}
-Duration: {duration} | Sentiment: {emoji} {sentiment}
-Participants: {participants}
-
-Summary:
-{2-3 sentence summary}
-
-Key Signals:
-• Objections: {objections}
-• Competitors: {competitors}
-• Pricing: {pricing discussed}
-• Next Steps: {next steps}
-
-🎙 Recording: {apollo_recording_url}
-
----
-Full Transcript:
-{transcript}
-```
+| `HUBSPOT_ACCESS_TOKEN` | All HubSpot API calls |
+| `ANTHROPIC_API_KEY` | Claude enrichment step |
