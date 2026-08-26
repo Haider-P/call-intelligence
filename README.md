@@ -106,16 +106,17 @@ call-intelligence/
 
 ## HubSpot Properties Required
 
-Create these on the Deal object before building:
+5 deal properties, verified against the Markaaz portal on 2026-08-26. `last_call_number`
+was dropped from the design — call sequencing still appears in the note text (see Note
+Format Output above) but is no longer written back as a deal property.
 
-| Property Label | Internal Name | Type |
-|---|---|---|
-| Next Steps | `next_steps` | Multi-line text |
-| Next Step Date | `next_step_date` | Date picker |
-| Last Call Sentiment | `last_call_sentiment` | Dropdown (positive/neutral/at-risk) |
-| Last Call Date | `last_call_date` | Date |
-| Last Call Number | `last_call_number` | Number |
-| Last Call Unresolved Objections | `last_call_unresolved_objections` | Multi-line text |
+| Property Label | Internal Name | Type | Status |
+|---|---|---|---|
+| Next Step | `hs_next_step` (HubSpot's built-in property) | Multi-line text | ✅ exists |
+| Next Step Date | `next_step_date` | Date | ✅ exists |
+| Last Call Sentiment | `last_call_sentiment` | Dropdown (positive/neutral/at-risk) | ⚠️ **not yet created** — confirmed missing portal-wide (active + archived deal properties, contacts) as of 2026-08-26; must be created before this pipeline can run |
+| Last Call Date | `last_call_date` | Date | ✅ exists |
+| Last Call Unresolved Objections | `last_call_unresolved_objections` | Single-line text | ✅ exists (previously documented here as "Multi-line text" — corrected to match the actual portal config) |
 
 ## Parking Lot — Phase 2
 

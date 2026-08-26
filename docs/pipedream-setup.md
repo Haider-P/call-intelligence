@@ -14,7 +14,9 @@ Step-by-step guide to building the Apollo → HubSpot call intelligence workflow
   - `crm.objects.notes.write`
   - `crm.objects.deals.read`
   - `crm.objects.deals.write`
-- [ ] 6 custom deal properties created in HubSpot (see README)
+- [ ] `last_call_sentiment` deal property created in HubSpot (the only one still missing
+  as of 2026-08-26 — `hs_next_step` is a HubSpot built-in, and `next_step_date`,
+  `last_call_date`, `last_call_unresolved_objections` already exist; see README)
 - [ ] Anthropic API key ready
 
 ---
@@ -38,7 +40,7 @@ In Pipedream → Settings → Environment Variables, add:
 | 2 | parse_hubspot_webhook | Code (Node.js) | Parse note + fetch prior call history |
 | 3 | claude_enrichment | Code (Node.js) | Claude AI signal extraction |
 | 4 | update_hubspot_note | Code (Node.js) | Update existing note with enriched format |
-| 5 | update_deal_properties | Code (Node.js) | Update deal Next Steps, Date, Sentiment |
+| 5 | update_deal_properties | Code (Node.js) | Update deal hs_next_step, Date, Sentiment |
 
 ---
 
@@ -84,10 +86,9 @@ Pipedream creates this automatically when you create a new workflow. Copy the we
 - [ ] Confirm Pipedream webhook fires
 - [ ] Confirm note is updated in place (not duplicated)
 - [ ] Confirm enriched format appears correctly in HubSpot
-- [ ] Confirm Next Steps property updated on deal
+- [ ] Confirm `hs_next_step` (Next Step) updated on deal
 - [ ] Confirm Next Step Date updated if date mentioned on call
 - [ ] Confirm Last Call Sentiment updated
-- [ ] Confirm Last Call Number increments correctly on 2nd call
 - [ ] Test objection tracking: run 2 calls, confirm unresolved objections carry forward
 
 ---

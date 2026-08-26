@@ -21,11 +21,10 @@ export default defineComponent({
 
     // Core properties — always update
     const properties = {
-      next_steps: signals.nextSteps,
+      hs_next_step: signals.nextSteps,
       last_call_sentiment: signals.sentiment,
       last_call_date: new Date(steps.parse_hubspot_webhook.$return_value.timestamp)
         .toISOString().split("T")[0],
-      last_call_number: callNumber.toString(),
       last_call_unresolved_objections: signals.objectionsUnresolved !== "None"
         ? signals.objectionsUnresolved
         : ""
