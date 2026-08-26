@@ -7,14 +7,49 @@
  * calls, internal calls, etc.) is left completely alone — Apollo's native HubSpot
  * logging already handles those and this pipeline must not touch them.
  *
- * WARNING — endpoint not independently verified: this file calls
- * `https://api.apollo.io/api/v1/conversations/search`, mirroring the base URL and auth
- * convention this repo already uses for Apollo's Organizations API (X-Api-Key header +
- * User-Agent, see markaaz-gtm/CLAUDE.md). The Conversation Intelligence endpoints were
- * NOT independently confirmed against Apollo's live API docs in this session — verify
- * the exact path/params at developer.apollo.io (or with Apollo support) before wiring
- * this into a live Zap. If the path differs, only the `searchApolloConversations()`
- * helper below needs to change — everything downstream consumes its normalized output.
+ * ENDPOINT — confirmed 2026-08-26 against docs.apollo.io:
+ *   POST https://api.apollo.io/api/v1/conversations/search
+ *   Request body params (official): page, num_fetch_result, conversation_type
+ *   ("video_conference" | "phone_call"), account_id, contact_ids, tag_ids, tracker_ids,
+ *   organization_ids, date_range, scorecard_template_id, scorecard_max_rating,
+ *   sort_by_field, enforce_contact_boundary. 0 credits per call.
+ *
+ *   IMPORTANT — there is NO documented topic/keyword search param (no "q_keywords" or
+ *   equivalent). This is a real API constraint, not a bug to fix later: the request
+ *   below only narrows by conversation_type + date_range; ALL partner-pattern matching
+ *   happens client-side in this file against each result's `topic` field.
+ *
+ *   conversation_type is set to "video_conference" (not "phone_call") — confirmed
+ *   correct for partner Zoom/Teams syncs: real production conversations pulled during
+ *   verification (e.g. "Socure/Markaaz Partnership", "Signicat x Markaaz weekly sync")
+ *   are multi-participant, host_id + participant_count-bearing meeting records, not
+ *   1:1 dialed calls.
+ *
+ * RESPONSE SHAPE — verified indirectly, not from a raw fetch() with our own key (see
+ * "Auth note" below): real conversation records definitely include a `topic` field
+ * (directly usable for client-side matching, confirmed against real production data —
+ * e.g. `"topic": "ZoomInfo/Markaaz Patnership"`, `"topic": "Socure/Markaaz Partnership "`
+ * — note real topics carry trailing whitespace and even typos; substring `.includes()`
+ * matching in matchPartnerFromTopic() below tolerates the whitespace fine, but a typo
+ * like "Patnership" would NOT match the "partnership" keyword — a real gap, left as-is
+ * per this task's scope (matching logic unchanged), flagged in the README instead),
+ * an `id`, and a `start_time` (ISO 8601). Real `state` values include
+ * "insights_generated" — richer than the four-value enum assumed in an earlier pass
+ * (created/downloaded/transcribed/processed). This pipeline doesn't filter on state,
+ * so it's informational only.
+ *
+ * The response envelope's exact top-level key (`conversations` vs `results` vs `data`)
+ * was not independently confirmed for the raw REST endpoint — the fallback chain in
+ * searchApolloConversations() below handles the most likely candidates defensively.
+ *
+ * Auth note: X-Api-Key + User-Agent (this repo's established Apollo convention) is
+ * confirmed to be RECOGNIZED by this exact endpoint — every markaaz-gtm Apollo key
+ * tested against it returned a scoped `403 API_INACCESSIBLE` naming this specific
+ * endpoint, not a generic 401 or a 404, which means Apollo's server parsed the header
+ * and evaluated that key's permissions. None of the three keys in markaaz-gtm's .env
+ * currently have the Conversations scope, so a full end-to-end request/response cycle
+ * with our own key was NOT completed — confirm with whoever provisions the Zapier
+ * deployment's Apollo key that it has Conversations API access before the first live run.
  *
  * Zapier wiring:
  *   Step type: Code by Zapier → "Run Javascript"
@@ -56,18 +91,26 @@ function matchPartnerFromTopic(topic) {
   return null;
 }
 
-async function searchApolloConversations(apiKey, sinceIso) {
-  const url = new URL("https://api.apollo.io/api/v1/conversations/search");
-  url.searchParams.set("start_time_min", sinceIso);
-  url.searchParams.set("per_page", "50");
-
-  const response = await fetch(url.toString(), {
-    method: "GET",
+async function searchApolloConversations(apiKey, sinceIso, nowIso) {
+  // POST with a JSON body, per the confirmed official request contract — this was
+  // previously (wrongly) a GET with query-string params. No topic/keyword param exists
+  // server-side; num_fetch_result + date_range narrow the batch, everything else is
+  // filtered client-side below against each result's `topic` field.
+  const response = await fetch("https://api.apollo.io/api/v1/conversations/search", {
+    method: "POST",
     headers: {
       "X-Api-Key": apiKey,
       "User-Agent": "markaaz-call-intelligence/2.0",
       "Content-Type": "application/json"
-    }
+    },
+    body: JSON.stringify({
+      page: 1,
+      num_fetch_result: 50, // batch size per poll; add pagination here if a single
+                             // polling window ever needs more than 50 conversations
+      conversation_type: "video_conference", // not "phone_call" — confirmed correct
+                                              // for partner Zoom/Teams syncs, see header
+      date_range: { min: sinceIso, max: nowIso }
+    })
   });
 
   if (!response.ok) {
@@ -76,8 +119,10 @@ async function searchApolloConversations(apiKey, sinceIso) {
   }
 
   const data = await response.json();
-  // Normalize to a flat array regardless of exact response envelope shape —
-  // adjust the fallback chain here if Apollo's real response nests differently.
+  // Envelope key not independently confirmed for the raw REST response — `conversations`
+  // is the best-evidenced candidate (seen in real production data via a different,
+  // already-authenticated Apollo integration channel during verification), kept as a
+  // defensive fallback chain since that evidence wasn't from this exact raw endpoint.
   return data.conversations || data.results || data.data || [];
 }
 
@@ -86,8 +131,9 @@ if (!apiKey) {
   throw new Error("APOLLO_API_KEY is not set in this Zap's environment variables");
 }
 
+const nowIso = new Date().toISOString();
 const sinceIso = new Date(Date.now() - LOOKBACK_HOURS * 60 * 60 * 1000).toISOString();
-const rawConversations = await searchApolloConversations(apiKey, sinceIso);
+const rawConversations = await searchApolloConversations(apiKey, sinceIso, nowIso);
 
 const candidateCalls = [];
 const unlistedPartnerFlags = [];

@@ -91,18 +91,44 @@ Plus a new HubSpot note per matched company, containing the raw extracted summar
 what was actually said about that company — the durable record, separate from the
 structured properties.
 
-## Endpoints that need verification before deploying
+## Apollo endpoints — confirmed 2026-08-26
 
 `01-filter-partner-calls.js` and `02-fetch-transcript.js` call Apollo's Conversation
-Intelligence REST API (`/api/v1/conversations/search`,
-`/api/v1/conversations/{id}/transcript`). These paths were **not independently
-confirmed** against Apollo's live API docs in the session that built this pipeline —
-they mirror this repo's established Apollo auth convention (X-Api-Key + User-Agent,
-same base URL as the Organizations API already used elsewhere in markaaz-gtm) but the
-Conversations paths themselves need a check against developer.apollo.io (or Apollo
-support) before the first live run. If the real paths differ, only the two fetch
-helper functions in those two files need to change — everything downstream consumes
-their already-normalized output and doesn't care about the wire format.
+Intelligence REST API, confirmed against docs.apollo.io:
+
+- `POST https://api.apollo.io/api/v1/conversations/search` — 0 credits per call.
+  Request body: `page`, `num_fetch_result`, `conversation_type`
+  (`"video_conference"` | `"phone_call"`), `account_id`, `contact_ids`, `tag_ids`,
+  `tracker_ids`, `organization_ids`, `date_range`, `scorecard_template_id`,
+  `scorecard_max_rating`, `sort_by_field`, `enforce_contact_boundary`.
+- `GET https://api.apollo.io/api/v1/conversations/{id}` — 0-1 credit per call (1 only
+  if the conversation has AI insights generated). Returns the full conversation record
+  — topic, state, transcript, etc. — as **one** object; there is no separate
+  `/conversations/{id}/transcript` path. (An earlier version of `02-fetch-transcript.js`
+  called that separate path — it doesn't exist and has been corrected.)
+
+**No server-side topic/keyword search exists on the search endpoint** — this is a
+documented constraint of the real API, not a bug: `01-filter-partner-calls.js` pulls a
+batch (narrowed only by `conversation_type` + `date_range`) and does all known-partner
+pattern matching client-side against each result's `topic` field.
+
+`conversation_type: "video_conference"` (not `"phone_call"`, and not `"meeting"` —
+an earlier draft assumed a `"meeting"` enum value that doesn't exist in the real API)
+is confirmed correct for partner Zoom/Teams syncs: real production conversations
+pulled during verification (e.g. `"Socure/Markaaz Partnership"`,
+`"Signicat x Markaaz weekly sync"`) are multi-participant meeting records with
+`host_id` and `participant_count`, not 1:1 dialed calls.
+
+**What's still not fully closed the loop:** neither endpoint was hit with a raw
+`fetch()` using one of markaaz-gtm's own Apollo keys — all three currently lack
+Conversations API scope (confirmed via a real `403 API_INACCESSIBLE` naming this exact
+endpoint, meaning the X-Api-Key + User-Agent auth mechanism itself is being correctly
+recognized — it's a scope gap, not an auth-format problem). The `topic`/`id`/
+`start_time`/`transcript` field names and the `"insights_generated"` state value were
+confirmed against real production data through a different, already-authenticated
+Apollo channel, not this exact raw endpoint — high confidence, not 100% certainty.
+Confirm Conversations scope on whichever Apollo key actually gets wired into the live
+Zap before the first real run.
 
 ## What this pipeline never touches
 

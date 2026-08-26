@@ -11,11 +11,16 @@ building, it explains the two judgment calls this design makes.
 ## Prerequisites
 
 - [ ] Apollo account with Conversation Intelligence / call recording enabled, and an
-      Apollo API key with access to it
-- [ ] **Verify Apollo's Conversations API endpoints before building** — see the
-      "Endpoints that need verification" section in `../zapier-v2-steps/README.md`. The
-      code assumes `/api/v1/conversations/search` and
-      `/api/v1/conversations/{id}/transcript`; confirm against developer.apollo.io.
+      Apollo API key **with Conversations API scope specifically** — confirm this
+      before building, since none of markaaz-gtm's existing Apollo keys have it (all
+      three returned a scoped `403 API_INACCESSIBLE` when tested against
+      `/api/v1/conversations/search`). See "Apollo endpoints — confirmed 2026-08-26" in
+      `../zapier-v2-steps/README.md` for the confirmed request/response contract —
+      `POST /api/v1/conversations/search` (0 credits) and
+      `GET /api/v1/conversations/{id}` (0-1 credit; there's no separate
+      `/transcript` path). No server-side topic search exists — that's a real API
+      constraint the code already accounts for by filtering client-side, not something
+      left to fix.
 - [ ] HubSpot Private App with scopes: `crm.objects.deals.read`,
       `crm.objects.deals.write`, `crm.objects.notes.write`
 - [ ] Anthropic API key
@@ -161,7 +166,8 @@ Digest by Zapier needs a separate scheduled release. Set this up as its own tiny
 
 | Issue | Fix |
 |---|---|
-| Apollo search/transcript calls 404 or return unexpected shape | The Conversations endpoint paths weren't independently verified — check against developer.apollo.io and adjust the fetch URLs in `01-filter-partner-calls.js` / `02-fetch-transcript.js` |
+| Apollo search/conversation calls return `403 API_INACCESSIBLE` | Your Apollo key doesn't have Conversations API scope — this is the same error every markaaz-gtm key returned during verification. Request a key/scope grant from whoever administers the Apollo account. |
+| Apollo calls return an unexpected response shape | The exact envelope key (`conversations` vs `results`/`data`) and transcript field shape were confirmed via real production data through a different Apollo integration channel, not a raw `fetch()` with a scoped key — see the "What's still not fully closed the loop" note in `../zapier-v2-steps/README.md`. If the shape differs, only the small parsing helpers in `01-filter-partner-calls.js` / `02-fetch-transcript.js` need adjusting. |
 | A known partner call isn't matching | Check the topic actually contains the partner name, "markaaz", and one of partnership/sync/weekly/bi-weekly — all three, any order, case-insensitive |
 | Claude enrichment returns generic ("follow up", "pricing concerns") instead of specifics | Check the transcript quality/length reaching Step D — a short or garbled transcript gives Claude nothing specific to extract |
 | Deal Matching reports "no matching deal found" for a deal you know exists | Check the deal name is exactly `{Partner} - {Company}` — the matcher tolerates punctuation/case variance but not a structurally different name |

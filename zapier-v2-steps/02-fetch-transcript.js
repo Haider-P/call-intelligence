@@ -3,12 +3,39 @@
  * ------------------------------------------------------------------------------------------
  * Runs once per matching call, inside the outer "Looping by Zapier" loop over
  * candidateCalls (after the Storage-by-Zapier dedup check — see setup guide). Fetches
- * the transcript for one conversation from Apollo.
+ * the full conversation record — including its transcript — for one conversation.
  *
- * WARNING — endpoint not independently verified, same caveat as Step 1: this calls
- * `https://api.apollo.io/api/v1/conversations/{id}/transcript`, mirroring this repo's
- * established Apollo auth convention (X-Api-Key + User-Agent) but not independently
- * confirmed against Apollo's live API docs. Verify before deploying.
+ * ENDPOINT — confirmed 2026-08-26 against docs.apollo.io:
+ *   GET https://api.apollo.io/api/v1/conversations/{id}
+ *   Path param: id (also accepts the "id_shareid" share-ID format, not used here).
+ *   This is ONE endpoint returning the full conversation record, NOT a separate
+ *   `/conversations/{id}/transcript` path — a prior version of this file called that
+ *   separate path, which does not exist in the official docs. Confirmed structurally
+ *   correct against real production data pulled during verification: a conversation
+ *   fetch's response carries `topic`, `state`, `start_time`, etc. AND a `transcript`
+ *   field together in the same object — exactly the "one endpoint, full details"
+ *   shape the docs describe.
+ *
+ *   CREDIT COST — differs from Step 1's free search: 0-1 credit per call, charged
+ *   only if the conversation has AI insights generated (1 credit); 0 if it doesn't.
+ *   This step runs once per matching call (not once per extracted company), so cost
+ *   scales with call volume, not with the number of companies discussed per call.
+ *
+ * RESPONSE SHAPE — verified indirectly, not from a raw fetch() with our own key (no
+ * available markaaz-gtm Apollo key has Conversations scope — see Step 1's header for
+ * the full auth-verification note, which applies identically here). Real conversation
+ * fetches (via a different, already-authenticated Apollo integration channel) showed
+ * the `transcript` field taking two different shapes depending on requested format:
+ *   - A plain string, already speaker-labeled and readable (e.g. "GREG BANY: I know.")
+ *     — the simplest and most directly usable case.
+ *   - A JSON-encoded STRING containing an array of segment objects, each with a
+ *     `spoken_sentence` field (not `text`) and a `conversation_participant_id`
+ *     (an opaque ID, not a resolved participant name — resolving it to a real name
+ *     would need a separate API call, out of scope here; segments are labeled by
+ *     that ID as a fallback).
+ * Both shapes are handled defensively below. If the raw REST endpoint's actual shape
+ * turns out to be neither, the error message names the conversation ID so it's easy
+ * to spot in Zapier's run history and extend the parser.
  *
  * Zapier wiring:
  *   Step type: Code by Zapier → "Run Javascript"
@@ -18,8 +45,19 @@
  *   output: { conversationId, transcriptText, partner, topic, startTime }
  */
 
-async function fetchApolloTranscript(apiKey, conversationId) {
-  const url = `https://api.apollo.io/api/v1/conversations/${conversationId}/transcript`;
+function segmentsToText(segments) {
+  return segments
+    .map((seg) => {
+      const label = seg.speaker || seg.participant_name || seg.conversation_participant_id;
+      const sentence = seg.spoken_sentence || seg.text || "";
+      return label ? `${label}: ${sentence}` : sentence;
+    })
+    .filter(Boolean)
+    .join("\n");
+}
+
+async function fetchApolloConversation(apiKey, conversationId) {
+  const url = `https://api.apollo.io/api/v1/conversations/${conversationId}`;
 
   const response = await fetch(url, {
     method: "GET",
@@ -32,20 +70,33 @@ async function fetchApolloTranscript(apiKey, conversationId) {
 
   if (!response.ok) {
     const errorText = await response.text();
-    throw new Error(`Apollo transcript fetch failed for ${conversationId}: ${response.status} — ${errorText}`);
+    throw new Error(`Apollo conversation fetch failed for ${conversationId}: ${response.status} — ${errorText}`);
   }
 
   const data = await response.json();
-  // Normalize to a plain string transcript regardless of exact response shape —
-  // adjust this fallback chain if Apollo returns segments/speakers instead of raw text.
-  if (typeof data.transcript === "string") return data.transcript;
-  if (Array.isArray(data.segments)) {
-    return data.segments
-      .map((seg) => `${seg.speaker ? seg.speaker + ": " : ""}${seg.text || ""}`)
-      .join("\n");
+  const rawTranscript = data.transcript;
+
+  // Case 1: already a plain, speaker-labeled string — use as-is.
+  if (typeof rawTranscript === "string") {
+    const trimmed = rawTranscript.trim();
+    if (trimmed.startsWith("[") || trimmed.startsWith("{")) {
+      // Case 2: a JSON-encoded string containing segment objects — parse, then flatten.
+      try {
+        const parsed = JSON.parse(trimmed);
+        if (Array.isArray(parsed)) return segmentsToText(parsed);
+      } catch (e) {
+        // fall through — not actually JSON, treat as plain text below
+      }
+    }
+    return rawTranscript;
   }
-  if (typeof data === "string") return data;
-  throw new Error(`Unrecognized transcript response shape for ${conversationId}`);
+
+  // Case 3: a native (already-parsed) array of segment objects.
+  if (Array.isArray(rawTranscript)) {
+    return segmentsToText(rawTranscript);
+  }
+
+  throw new Error(`Unrecognized transcript shape on conversation ${conversationId}`);
 }
 
 const apiKey = process.env.APOLLO_API_KEY;
@@ -58,7 +109,7 @@ if (!conversationId) {
   throw new Error("No conversationId in inputData — check the loop item field mapping");
 }
 
-const transcriptText = await fetchApolloTranscript(apiKey, conversationId);
+const transcriptText = await fetchApolloConversation(apiKey, conversationId);
 
 output = {
   conversationId,
