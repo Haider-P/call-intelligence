@@ -1,5 +1,16 @@
 # 📞 Call Intelligence — Apollo → HubSpot
 
+> **Status (2026-08-26): this Pipedream pipeline is abandoned.** It never got past
+> incomplete HubSpot property setup and unconfirmed deployment status. It's also
+> architecturally the wrong shape for partner-sync calls (assumes one call = one deal,
+> which doesn't hold when a call discusses a dozen end-customers at once).
+> **The active pipeline is `zapier-v2-steps/`** — a Zapier-based rebuild scoped
+> specifically to partner-sync calls (Socure, Zenoo, ZoomInfo, Signicat, Oscilar), with
+> a multi-company-per-call extraction model, validated live against a real call. See
+> `zapier-v2-steps/README.md` and `docs/zapier-v2-setup.md`. Everything below this line
+> describes the abandoned Pipedream design, kept for historical reference only — same
+> reason `zapier-steps/` (the version before this one) was kept.
+
 Automated pipeline that captures Apollo call summaries, enriches them with Claude AI, and builds a compounding intelligence layer on every HubSpot deal — inspired by Granola's approach to meeting memory.
 
 ## What It Does
@@ -90,16 +101,25 @@ Full Transcript:
 
 ```
 call-intelligence/
-├── pipedream-steps/
+├── zapier-v2-steps/                  # ACTIVE — partner-sync pipeline, see its own README
+│   ├── 01-filter-partner-calls.js
+│   ├── 02-fetch-transcript.js
+│   ├── 03-claude-enrichment.js
+│   ├── 04-deal-matching.js
+│   ├── 05-write-deal-and-note.js
+│   ├── .env.example
+│   └── README.md
+├── docs/
+│   ├── zapier-v2-setup.md            # Step-by-step guide for the active pipeline
+│   └── pipedream-setup.md            # Step-by-step guide for the abandoned pipeline below
+├── pipedream-steps/                  # ABANDONED — kept for historical reference
 │   ├── 01-parse-hubspot-webhook.js   # Webhook handler + prior call history fetch
 │   ├── 02-claude-enrichment.js       # Claude AI extraction + objection tracking
 │   ├── 03-update-hubspot-note.js     # Update existing note with enriched format
 │   └── 04-update-deal-properties.js  # Update Next Steps, Date, Sentiment, Call #
-├── zapier-steps/                     # Original Zapier steps (deprecated, kept for reference)
+├── zapier-steps/                     # Original Zapier steps (deprecated before Pipedream too, kept for reference)
 ├── prompts/
-│   └── extraction-prompt.md          # Claude prompt template + tuning guide
-├── docs/
-│   └── pipedream-setup.md            # Step-by-step Pipedream build guide
+│   └── extraction-prompt.md          # Claude prompt template + tuning guide (Pipedream version)
 ├── .env.example
 └── README.md
 ```
