@@ -112,6 +112,21 @@ documented constraint of the real API, not a bug: `01-filter-partner-calls.js` p
 batch (narrowed only by `conversation_type` + `date_range`) and does all known-partner
 pattern matching client-side against each result's `topic` field.
 
+**Known typo-tolerance gap — RESOLVED 2026-08-27.** A real production topic was found
+with a typo: `"ZoomInfo/Markaaz Patnership"` (missing the "r" in "Partnership"). Under
+the original exact-substring match this silently failed to match and the call would
+never have been processed — no error, just missed. `matchPartnerFromTopic()` in
+`01-filter-partner-calls.js` now tokenizes the topic and checks each sync keyword via
+(1) an exact alias map (`SYNC_KEYWORD_ALIASES`, which explicitly covers this confirmed
+"Patnership" typo) and (2) a Levenshtein edit-distance check (tolerance of 1 character)
+as a general fallback for other single-letter typos of the same shape. Partner-name
+matching (`Socure`, `ZoomInfo`, etc.) intentionally stays an exact substring check, not
+fuzzy — those names are short/distinctive enough that fuzzing them risks false
+positives against unrelated calls. Covered by
+`zapier-v2-steps/tests/01-filter-partner-calls.test.js` (run with
+`node zapier-v2-steps/tests/01-filter-partner-calls.test.js`), including a regression
+check that an unrelated topic (`"Weekly Team Standup"`) still does not match.
+
 `conversation_type: "video_conference"` (not `"phone_call"`, and not `"meeting"` —
 an earlier draft assumed a `"meeting"` enum value that doesn't exist in the real API)
 is confirmed correct for partner Zoom/Teams syncs: real production conversations

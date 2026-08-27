@@ -30,10 +30,10 @@
  * (directly usable for client-side matching, confirmed against real production data —
  * e.g. `"topic": "ZoomInfo/Markaaz Patnership"`, `"topic": "Socure/Markaaz Partnership "`
  * — note real topics carry trailing whitespace and even typos; substring `.includes()`
- * matching in matchPartnerFromTopic() below tolerates the whitespace fine, but a typo
- * like "Patnership" would NOT match the "partnership" keyword — a real gap, left as-is
- * per this task's scope (matching logic unchanged), flagged in the README instead),
- * an `id`, and a `start_time` (ISO 8601). Real `state` values include
+ * matching in matchPartnerFromTopic() below tolerates the whitespace fine, and as of
+ * 2026-08-27 also tolerates the "Patnership" typo — RESOLVED, see the sync-keyword
+ * alias map and the Levenshtein fuzzy check in matchPartnerFromTopic() below), an `id`,
+ * and a `start_time` (ISO 8601). Real `state` values include
  * "insights_generated" — richer than the four-value enum assumed in an earlier pass
  * (created/downloaded/transcribed/processed). This pipeline doesn't filter on state,
  * so it's informational only.
@@ -68,8 +68,72 @@
 // ---- Config: known partners + topic pattern -------------------------------------
 // To add a new partner later: just add its name to this array. No pattern-string
 // changes needed — matching is name + "markaaz" + a sync keyword, all order-independent.
+// Partner names are matched with an exact substring check (not fuzzy) — they're short
+// and distinctive enough that Levenshtein-fuzzing them risks false positives against
+// unrelated calls (e.g. a 1-edit fuzz on "Socure" could catch unrelated words).
 const KNOWN_PARTNERS = ["Socure", "Zenoo", "ZoomInfo", "Signicat", "Oscilar"];
 const SYNC_KEYWORDS = ["partnership", "sync", "weekly", "bi-weekly"];
+
+// Known human typos of a sync keyword, confirmed live in production data (real topic:
+// "ZoomInfo/Markaaz Patnership", 2026-08-27 — missing the "r" in "Partnership"). Checked
+// as an exact, cheap lookup before falling back to the Levenshtein fuzzy check below —
+// belt and suspenders: guarantees this exact confirmed typo always matches even if the
+// fuzzy-distance threshold logic ever changes.
+const SYNC_KEYWORD_ALIASES = {
+  patnership: "partnership"
+};
+
+// Max Levenshtein edit distance to tolerate between a topic token and a sync keyword.
+// Kept at 1 deliberately: wide enough to catch a single missing/swapped/extra letter
+// (real-world typos like "Patnership") without loosening so much that unrelated short
+// words start colliding with keywords like "sync".
+const MAX_KEYWORD_EDIT_DISTANCE = 1;
+
+// Standard dynamic-programming edit distance (insert/delete/substitute, cost 1 each).
+function levenshtein(a, b) {
+  const m = a.length;
+  const n = b.length;
+  if (m === 0) return n;
+  if (n === 0) return m;
+
+  const dp = Array.from({ length: m + 1 }, () => new Array(n + 1).fill(0));
+  for (let i = 0; i <= m; i++) dp[i][0] = i;
+  for (let j = 0; j <= n; j++) dp[0][j] = j;
+
+  for (let i = 1; i <= m; i++) {
+    for (let j = 1; j <= n; j++) {
+      if (a[i - 1] === b[j - 1]) {
+        dp[i][j] = dp[i - 1][j - 1];
+      } else {
+        dp[i][j] = 1 + Math.min(dp[i - 1][j - 1], dp[i - 1][j], dp[i][j - 1]);
+      }
+    }
+  }
+  return dp[m][n];
+}
+
+// Tokenizes the topic and checks each token against SYNC_KEYWORDS: first via the exact
+// alias map (cheap, guarantees the confirmed "Patnership" typo), then via Levenshtein
+// distance <= MAX_KEYWORD_EDIT_DISTANCE (catches other single-letter typos of the same
+// shape). Token-based rather than whole-string `.includes()` because edit distance on
+// the full topic string against a short keyword isn't meaningful — a topic is many
+// words, a keyword is one.
+function hasFuzzySyncKeyword(topicLower) {
+  const tokens = topicLower.split(/[^a-z0-9-]+/).filter(Boolean);
+  for (const rawToken of tokens) {
+    const token = SYNC_KEYWORD_ALIASES[rawToken] || rawToken;
+    for (const keyword of SYNC_KEYWORDS) {
+      if (token === keyword) return true;
+      if (
+        Math.abs(token.length - keyword.length) <= MAX_KEYWORD_EDIT_DISTANCE &&
+        levenshtein(token, keyword) <= MAX_KEYWORD_EDIT_DISTANCE
+      ) {
+        return true;
+      }
+    }
+  }
+  return false;
+}
 
 // How far back to search on each hourly poll. Deliberately wider than the 1-hour
 // trigger interval so a slow Apollo sync or a missed/late poll doesn't drop a call —
@@ -80,11 +144,16 @@ const LOOKBACK_HOURS = 3;
 function matchPartnerFromTopic(topic) {
   const topicLower = (topic || "").toLowerCase();
   if (!topicLower.includes("markaaz")) return null;
+  // Sync-keyword match tolerates a single-character typo (alias map + Levenshtein
+  // fuzzy check, see hasFuzzySyncKeyword above) — computed once per topic, not once
+  // per partner, since it doesn't depend on which partner we're checking.
+  const hasSyncKeyword = hasFuzzySyncKeyword(topicLower);
+  if (!hasSyncKeyword) return null;
   for (const partner of KNOWN_PARTNERS) {
     const partnerLower = partner.toLowerCase();
-    const hasPartnerName = topicLower.includes(partnerLower);
-    const hasSyncKeyword = SYNC_KEYWORDS.some((kw) => topicLower.includes(kw));
-    if (hasPartnerName && hasSyncKeyword) {
+    // Partner name matching stays an exact substring check — no fuzzing here, see the
+    // KNOWN_PARTNERS comment above.
+    if (topicLower.includes(partnerLower)) {
       return partner;
     }
   }
