@@ -21,19 +21,29 @@ const SOURCE_PATH = path.join(__dirname, "..", "04-match-and-write-companies.js"
 const source = fs.readFileSync(SOURCE_PATH, "utf8");
 
 // Simulated HubSpot deal roster. "Socure - Paymitto" exercises the alias path
-// ("PayMeadow" -> "Paymitto"); "Socure - U.S. Bank" exercises the pre-existing
-// normalize()-based fuzzy path (extracted as "US Bank", no alias needed).
+// ("PayMeadow"/"Pay Meadow" -> "Paymitto"); "Socure - US Bank" (note: NO periods —
+// this is the real HubSpot deal name; the enrichment step extracts the punctuated
+// "U.S. Bank" from the transcript) exercises the fuzzy normalize()-based path.
 const HUBSPOT_DEALS = [
   { id: "d1", properties: { dealname: "Socure - Paymitto" } },
-  { id: "d2", properties: { dealname: "Socure - U.S. Bank" } },
-  { id: "d3", properties: { dealname: "Socure - SentimentTestCo" } }
+  { id: "d2", properties: { dealname: "Socure - US Bank" } },
+  { id: "d3", properties: { dealname: "Socure - SentimentTestCo" } },
+  // The 4 aliases confirmed 2026-08-29 — see COMPANY_NAME_ALIASES in the source file.
+  { id: "n1", properties: { dealname: "Socure - OpenFx" } },
+  { id: "n2", properties: { dealname: "Socure - Polymarket" } },
+  { id: "n3", properties: { dealname: "Socure - WeBull" } },
+  { id: "n4", properties: { dealname: "Socure - Partos" } }
 ];
 
-// Loose substring match on alphanumeric-only text, standing in for HubSpot's real
-// free-text search relevance (which isn't literal substring matching on the raw
-// strings — e.g. it does find "U.S. Bank" for a "US Bank" query).
+// Case-insensitive substring match — deliberately does NOT strip punctuation, unlike
+// an earlier version of this mock. Real HubSpot search relevance can be sensitive to
+// literal punctuation (that's the root cause a live "U.S. Bank" -> "US Bank" match
+// failure traced back to — see matchCompanyDeal()'s 2026-08-29 comment). Because this
+// mock doesn't paper over punctuation differences itself, a test only passes if the
+// SOURCE CODE already normalized the query before sending it — making this mock an
+// actual regression guard for that fix, not an accidentally-lenient stand-in for it.
 function mockSearchKey(s) {
-  return s.toLowerCase().replace(/[^a-z0-9]/g, "");
+  return s.toLowerCase();
 }
 
 let noteCounter = 0;
@@ -140,7 +150,7 @@ async function main() {
   {
     const companies = [
       company("PayMeadow"), // alias -> Paymitto
-      company("US Bank"), // fuzzy (normalize()) -> "U.S. Bank"
+      company("U.S. Bank"), // fuzzy (normalize()) -> real deal "US Bank" (no periods)
       company("Totally Unknown Company Inc") // no match
     ];
     const { output, delayCalls } = await runStep({
@@ -151,7 +161,7 @@ async function main() {
 
     assert.strictEqual(output.results.length, 3);
     assert.strictEqual(output.companiesProcessed, 3);
-    assert.strictEqual(output.companiesMatched, 2, "PayMeadow and US Bank should both match");
+    assert.strictEqual(output.companiesMatched, 2, "PayMeadow and U.S. Bank should both match");
     assert.strictEqual(output.companiesNoMatch, 1);
     assert.strictEqual(output.companiesSkippedTimeout, 0);
     assert.strictEqual(output.companiesErrored, 0);
@@ -225,6 +235,95 @@ async function main() {
     assert.strictEqual(output.companiesMatched, 1);
 
     console.log("PASS: fallback to inputData.companies (genuine array) works when companiesJson is absent");
+  }
+
+  // Whitespace-insensitive alias lookup (added 2026-08-29 after a live "Pay Meadow"
+  // — WITH a space — failed to match the existing "paymeadow" (no space) alias,
+  // despite that alias already covering this exact real company). Root cause:
+  // normalizeCompanyKey() only collapsed whitespace down to a single space rather
+  // than stripping it entirely, so "Pay Meadow" normalized to "pay meadow" (one
+  // space) — a different string from the stored "paymeadow" key. Both spacing
+  // variants, run in the SAME call, must resolve to the exact same deal.
+  {
+    const companies = [company("PayMeadow"), company("Pay Meadow"), company("pay   meadow")];
+    const { output } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(output.companiesMatched, 3, "all 3 spacing variants of the same alias should match");
+    for (const result of output.results) {
+      assert.strictEqual(result.status, "written");
+      assert.strictEqual(result.companyName, "Paymitto", "every spacing variant should resolve to the same aliased real name");
+      assert.strictEqual(result.dealId, "d1", "every spacing variant should resolve to the exact same deal");
+    }
+
+    console.log("PASS: 'PayMeadow', 'Pay Meadow', and 'pay   meadow' all resolve to the same alias/deal regardless of spacing");
+  }
+
+  // The 4 newly confirmed aliases (2026-08-29), each written with a fully
+  // whitespace-stripped key per the fixed normalizeCompanyKey() convention. Fuse
+  // Finance was confirmed as a genuinely non-existent deal (correctly stays
+  // unmatched, no alias/fix needed) — not added to the mock roster, and not
+  // separately tested here beyond what the existing no-match tests already cover
+  // generically.
+  {
+    const companies = [
+      company("Open FX"), // alias key "openfx" -> "OpenFx"
+      company("Poly Market"), // alias key "polymarket" -> "Polymarket"
+      company("Weeble"), // alias key "weeble" -> "WeBull"
+      company("Paros") // alias key "paros" -> "Partos"
+    ];
+    const { output } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(output.companiesMatched, 4, "all 4 newly confirmed aliases should match");
+    const [openFx, polyMarket, weeble, paros] = output.results;
+    assert.strictEqual(openFx.companyName, "OpenFx");
+    assert.strictEqual(openFx.dealId, "n1");
+    assert.strictEqual(polyMarket.companyName, "Polymarket");
+    assert.strictEqual(polyMarket.dealId, "n2");
+    assert.strictEqual(weeble.companyName, "WeBull");
+    assert.strictEqual(weeble.dealId, "n3");
+    assert.strictEqual(paros.companyName, "Partos");
+    assert.strictEqual(paros.dealId, "n4");
+
+    console.log("PASS: all 4 newly confirmed aliases (Open FX, Poly Market, Weeble, Paros) match correctly");
+  }
+
+  // Dedicated regression test: "U.S. Bank" (transcribed, WITH periods) -> "US Bank"
+  // (the real HubSpot deal name, no periods). Root cause (2026-08-29): normalize()
+  // itself was never broken (normalize("U.S. Bank") === normalize("US Bank")
+  // already) -- the bug was that the RAW punctuated name was sent as the HubSpot
+  // search query, so a punctuation-sensitive search could return zero candidates
+  // before normalize()'s comparison ever got a chance to run. This mock's
+  // mockSearchKey() deliberately does NOT strip punctuation itself (see its own
+  // comment above), so this test only passes if matchCompanyDeal() actually
+  // normalizes the query before searching -- a real regression guard, not
+  // window-dressing.
+  {
+    const companies = [company("U.S. Bank")];
+    const { output, searchWaveLog } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(output.companiesMatched, 1, "'U.S. Bank' should match the real 'US Bank' deal despite the punctuation difference");
+    assert.strictEqual(output.results[0].dealId, "d2");
+
+    assert.strictEqual(searchWaveLog.length, 1);
+    assert.strictEqual(
+      searchWaveLog[0].query,
+      "us bank",
+      "the outbound HubSpot search query must already be normalized (lowercased, periods stripped) before it's sent, not the raw 'U.S. Bank'"
+    );
+
+    console.log("PASS: 'U.S. Bank' matches the real 'US Bank' deal via a normalized search query, not just a normalized post-search comparison");
   }
 
   // The exact real-world bug this change fixes: Zapier's "Step Output {...}" picker

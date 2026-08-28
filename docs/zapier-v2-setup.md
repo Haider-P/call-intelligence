@@ -185,6 +185,50 @@ this exact change (see `zapier-v2-steps/tests/04-match-and-write-companies.test.
 — it still stops cleanly and labels every unattempted company correctly, it just may
 trigger at a somewhat lower company-count threshold than before.
 
+**Company-name matching: alias list and two root-caused fixes (2026-08-29).**
+`COMPANY_NAME_ALIASES` in Step E (`04-match-and-write-companies.js`) currently covers:
+
+| Transcribed (confirmed live) | Real HubSpot deal name |
+|---|---|
+| PayMeadow / Pay Meadow (any spacing) | Paymitto |
+| Valera | Velera |
+| Green Sky | Greensky |
+| Open FX | OpenFx |
+| Poly Market | Polymarket |
+| Weeble | WeBull |
+| Paros | Partos |
+
+("Fuse Finance" was also tested live and confirmed as a genuinely non-existent deal —
+correctly stays unmatched, no alias needed.) This is a living list — see the
+maintenance comment directly above `COMPANY_NAME_ALIASES` in the source file before
+adding a new entry.
+
+Two real bugs, not new transcription quirks, were found and fixed while confirming
+these — both are the kind of thing that's tempting to "fix" by just adding another
+alias entry, which would have papered over the actual gap instead of closing it:
+
+- **Whitespace-insensitive alias lookup was broken.** "Pay Meadow" (transcribed WITH
+  a space) failed to match the already-existing "paymeadow" (no space) alias for the
+  exact same company. Root cause: `normalizeCompanyKey()` only *collapsed* whitespace
+  runs down to a single space, it never *stripped* it — so "Pay Meadow" normalized to
+  `"pay meadow"` (one space), a different string from the stored `"paymeadow"` key
+  (zero spaces). Fixed by stripping whitespace entirely in that function, and by
+  rewriting every `COMPANY_NAME_ALIASES` key in that same fully-stripped form (e.g.
+  `"green sky"` → `"greensky"`) so incoming names and stored keys can't diverge on
+  spacing again, for any alias — not a fix scoped to this one pair.
+- **The existing fuzzy-match fallback (`normalize()`) wasn't actually being applied to
+  the HubSpot search query.** "U.S. Bank" (transcribed) failed to match the real "US
+  Bank" deal, even though `normalize("U.S. Bank")` and `normalize("US Bank")` already
+  produced the identical string — that comparison logic was never broken. The real gap:
+  the *raw, still-punctuated* company name was sent as the literal HubSpot search
+  query, so if HubSpot's own search relevance is sensitive to the periods, the real
+  deal could come back with zero candidates — `normalize()`'s (correct) comparison
+  never got a chance to run on a candidate the search never returned. Fixed by
+  searching with an already-normalized (lowercased, punctuation-stripped) query
+  instead of the raw name — this closes the gap for any punctuation/casing variant
+  generally, not just "U.S. Bank" specifically, and cannot return fewer candidates than
+  the raw query would have.
+
 **HubSpot dropdown option casing (`last_call_sentiment`).** Live testing hit a
 different real error, unrelated to matching or rate-limiting: HubSpot 400
 `INVALID_OPTION` on every write. Cause: the `last_call_sentiment` property is a

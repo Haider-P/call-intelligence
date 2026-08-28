@@ -137,13 +137,29 @@ positives against unrelated calls. Covered by
 `node zapier-v2-steps/tests/01-filter-partner-calls.test.js`), including a regression
 check that an unrelated topic (`"Weekly Team Standup"`) still does not match.
 
-**Known company-name transcription gaps — RESOLVED 2026-08-28.** Real Claude enrichment
-output surfaced 3 confirmed mismatches too large for punctuation/case tolerance to
-safely catch: `"PayMeadow"` → `"Paymitto"`, `"Valera"` → `"Velera"`, `"Green Sky"` →
-`"Greensky"`. `COMPANY_NAME_ALIASES` in `04-match-and-write-companies.js` (checked
-before the HubSpot search, falling through to the existing fuzzy match if no alias
-hits) is a living list — append a new entry whenever a new mismatch is confirmed, same
-maintenance pattern as `SYNC_KEYWORD_ALIASES` above. Covered by
+**Known company-name transcription gaps — RESOLVED 2026-08-28, extended 2026-08-29.**
+Real Claude enrichment output surfaced confirmed mismatches too large for
+punctuation/case tolerance to safely catch: `"PayMeadow"`/`"Pay Meadow"` (any
+spacing) → `"Paymitto"`, `"Valera"` → `"Velera"`, `"Green Sky"` → `"Greensky"`,
+`"Open FX"` → `"OpenFx"`, `"Poly Market"` → `"Polymarket"`, `"Weeble"` → `"WeBull"`,
+`"Paros"` → `"Partos"`. (`"Fuse Finance"` was also tested and confirmed as a
+genuinely non-existent deal — correctly stays unmatched, no alias needed.)
+`COMPANY_NAME_ALIASES` in `04-match-and-write-companies.js` (checked before the
+HubSpot search, falling through to the existing fuzzy match if no alias hits) is a
+living list — append a new entry whenever a new mismatch is confirmed, same
+maintenance pattern as `SYNC_KEYWORD_ALIASES` above.
+
+**Two root-caused bugs, fixed 2026-08-29, not papered over with more aliases:**
+(1) `normalizeCompanyKey()` only collapsed whitespace to a single space rather than
+stripping it entirely, so a spacing variant of an already-aliased name (e.g. "Pay
+Meadow" vs the stored "paymeadow") could silently miss — fixed by stripping all
+whitespace, with every alias key rewritten in that same fully-stripped form. (2) the
+fuzzy `normalize()` fallback's own comparison logic was never broken, but the RAW,
+still-punctuated company name was being sent as the literal HubSpot search query, so
+a punctuation-sensitive search could return zero candidates for "U.S. Bank" before
+`normalize()` ever got a chance to compare — fixed by searching with an
+already-normalized query instead. See `docs/zapier-v2-setup.md`'s "Company-name
+matching" section for the full root-cause writeup. Covered by
 `zapier-v2-steps/tests/04-match-and-write-companies.test.js`.
 
 `conversation_type: "video_conference"` (not `"phone_call"`, and not `"meeting"` —

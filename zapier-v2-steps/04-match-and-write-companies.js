@@ -104,21 +104,39 @@
 // LIVING LIST: append a new entry here whenever a new transcription mismatch is
 // confirmed against a real company/deal — same maintenance pattern as
 // SYNC_KEYWORD_ALIASES in 01-filter-partner-calls.js. Keys must be normalized via
-// normalizeCompanyKey() below (lowercase, trimmed, whitespace-collapsed) so a lookup
-// matches regardless of how the alias happens to be capitalized/spaced.
+// normalizeCompanyKey() below (lowercase, trimmed, ALL whitespace stripped — not just
+// collapsed, see that function's comment) so a lookup matches regardless of how the
+// alias happens to be capitalized or spaced. Write new keys with NO spaces at all
+// (e.g. "openfx", not "open fx") — normalizeCompanyKey() strips whitespace from the
+// incoming name before lookup, so a key containing a space could never be reached.
 const COMPANY_NAME_ALIASES = {
-  paymeadow: "Paymitto", // confirmed 2026-08-28, Socure/Markaaz Partnership call
+  paymeadow: "Paymitto", // confirmed 2026-08-28, Socure/Markaaz Partnership call — also covers "Pay Meadow" (with a space) as of 2026-08-29, see normalizeCompanyKey()'s root-cause comment below
   valera: "Velera", // confirmed 2026-08-28, Socure/Markaaz Partnership call
-  "green sky": "Greensky" // confirmed 2026-08-28, Socure/Markaaz Partnership call
+  greensky: "Greensky", // confirmed 2026-08-28, Socure/Markaaz Partnership call — key changed from "green sky" to "greensky" 2026-08-29 to match the fixed normalizeCompanyKey() output format (see below); same alias, same pair, key format only
+  openfx: "OpenFx", // confirmed 2026-08-29
+  polymarket: "Polymarket", // confirmed 2026-08-29
+  weeble: "WeBull", // confirmed 2026-08-29
+  paros: "Partos" // confirmed 2026-08-29
 };
 
-// Lowercase + trim + collapse whitespace — used only to key into
-// COMPANY_NAME_ALIASES, so "Green Sky", "green sky", and "  Green   Sky " all hit the
-// same "green sky" alias regardless of case or spacing. Distinct from normalize()
-// below, which additionally strips punctuation for comparing against real HubSpot
-// deal names once a company name (aliased or not) is being searched for.
+// Lowercase + trim + strip ALL internal whitespace (not just collapse runs down to a
+// single space) — used only to key into COMPANY_NAME_ALIASES, so "Pay Meadow",
+// "PayMeadow", "pay   meadow", and "paymeadow" all normalize to the exact same
+// "paymeadow" key regardless of spacing. Distinct from normalize() below, which
+// additionally strips punctuation and is used for comparing against real HubSpot deal
+// names, not for alias-map lookups.
+//
+// ROOT CAUSE (2026-08-29): a live "Pay Meadow" (transcribed WITH a space) failed to
+// match the existing "paymeadow" (no space) alias, even though that alias was already
+// confirmed to cover this exact real company. The prior version of this function only
+// COLLAPSED whitespace (`replace(/\s+/g, " ")`) rather than stripping it entirely —
+// "Pay Meadow" normalized to "pay meadow" (one space), a different string from the
+// stored "paymeadow" key (zero spaces), so the lookup silently missed. Stripping
+// whitespace entirely fixes this generally, for any alias, not just this one pair —
+// every COMPANY_NAME_ALIASES key above is written in this same fully-stripped form so
+// incoming names and stored keys can never diverge on spacing again.
 function normalizeCompanyKey(str) {
-  return (str || "").toLowerCase().trim().replace(/\s+/g, " ");
+  return (str || "").toLowerCase().trim().replace(/\s+/g, "");
 }
 
 function normalize(str) {
@@ -165,7 +183,21 @@ async function matchCompanyDeal(token, partner, rawCompanyName) {
   const targetDealName = `${partner} - ${companyName}`;
   const targetNormalized = normalize(targetDealName);
 
-  const candidates = await searchHubSpotDeals(token, companyName);
+  // ROOT CAUSE (2026-08-29): a live "U.S. Bank" -> "US Bank" match failed even though
+  // normalize() itself was never the problem — normalize("U.S. Bank") and
+  // normalize("US Bank") both already produce "us bank", so the post-search
+  // comparison below was always correct in isolation. The actual gap: the RAW,
+  // still-punctuated companyName used to be sent as the search query itself
+  // (searchHubSpotDeals(token, companyName)). If HubSpot's own search relevance is
+  // sensitive to the literal periods in "U.S. Bank", the real deal ("Socure - US
+  // Bank") may never come back as a candidate at all — normalize()'s comparison never
+  // gets a chance to run on a candidate the search never returned in the first place.
+  // Searching with an already-normalized (lowercased, punctuation-stripped) query
+  // instead closes that gap for any punctuation/casing variant, not just this one
+  // pair — and can only ever return the same or more candidates than the raw,
+  // punctuated query would, never fewer.
+  const searchQuery = normalize(companyName);
+  const candidates = await searchHubSpotDeals(token, searchQuery);
 
   const exactMatches = candidates.filter(
     (d) => normalize(d.properties.dealname) === targetNormalized
