@@ -34,8 +34,10 @@
  *     anthropicApiKey
  *   output: { companies: [...], partner, startTime, companyCount }
  *
- * companies feeds the inner "Looping by Zapier" step (one iteration per company),
- * which then goes to Deal Matching (04) and Write (05).
+ * companies feeds Step 4 (04-match-and-write-companies.js) directly — that step loops
+ * over `companies` internally in plain JavaScript, not via a second "Looping by
+ * Zapier" step (Zapier does not support more than one per Zap; see "Why only one
+ * native loop" in ../../docs/zapier-v2-setup.md).
  */
 
 function buildPrompt(transcriptText, partner) {
@@ -79,7 +81,15 @@ async function callClaude(apiKey, prompt) {
       "anthropic-version": "2023-06-01"
     },
     body: JSON.stringify({
-      model: "claude-sonnet-4-6",
+      // Model swapped from claude-sonnet-4-6 -> claude-haiku-4-5-20251001 2026-08-28,
+      // confirmed live in Zapier's Code editor (this backports that change into the
+      // source file). Zapier's Code step has a hard 30-second timeout; Sonnet exceeded
+      // it on a full-length partner-sync transcript (~6000 words). Haiku completed in
+      // ~16.5s with no confirmed quality regression — validated live against the
+      // 2026-08-26 Socure/Markaaz Partnership call: all 14 companies correctly
+      // extracted, specific details preserved (e.g. the Swipe Jobs $11M-vs-$300K
+      // contract-figure discrepancy, not flattened into a generic "pricing concerns").
+      model: "claude-haiku-4-5-20251001",
       max_tokens: 4000,
       messages: [{ role: "user", content: prompt }]
     })
