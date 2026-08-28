@@ -32,7 +32,11 @@ const HUBSPOT_DEALS = [
   { id: "n1", properties: { dealname: "Socure - OpenFx" } },
   { id: "n2", properties: { dealname: "Socure - Polymarket" } },
   { id: "n3", properties: { dealname: "Socure - WeBull" } },
-  { id: "n4", properties: { dealname: "Socure - Partos" } }
+  { id: "n4", properties: { dealname: "Socure - Partos" } },
+  // Confirmed 2026-08-29 via direct lookup — distinct from n4 above: "Paros"
+  // (transcript drops the "t") -> "Partos", vs. "Partos" (transcript drops "AI")
+  // -> "Partos AI". Two separate real companies, two separate alias keys.
+  { id: "n5", properties: { dealname: "Socure - Partos AI" } }
 ];
 
 // Case-insensitive substring match — deliberately does NOT strip punctuation, unlike
@@ -293,6 +297,25 @@ async function main() {
     assert.strictEqual(paros.dealId, "n4");
 
     console.log("PASS: all 4 newly confirmed aliases (Open FX, Poly Market, Weeble, Paros) match correctly");
+  }
+
+  // "Partos" -> "Partos AI" (confirmed 2026-08-29 via direct lookup). Distinct from
+  // the "paros" -> "Partos" alias above -- two different real companies that both
+  // happen to collide near the word "Partos", so this also confirms the two keys
+  // ("paros" and "partos") don't cross-match each other.
+  {
+    const companies = [company("Partos")];
+    const { output } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(output.companiesMatched, 1);
+    assert.strictEqual(output.results[0].companyName, "Partos AI", "alias-resolved name should be 'Partos AI', not 'Partos'");
+    assert.strictEqual(output.results[0].dealId, "n5");
+
+    console.log("PASS: 'Partos' resolves to 'Partos AI', distinct from the 'paros' -> 'Partos' alias");
   }
 
   // Dedicated regression test: "U.S. Bank" (transcribed, WITH periods) -> "US Bank"

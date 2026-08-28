@@ -197,9 +197,13 @@ trigger at a somewhat lower company-count threshold than before.
 | Poly Market | Polymarket |
 | Weeble | WeBull |
 | Paros | Partos |
+| Partos | Partos AI |
 
-("Fuse Finance" was also tested live and confirmed as a genuinely non-existent deal —
-correctly stays unmatched, no alias needed.) This is a living list — see the
+(Note "Paros" → "Partos" and "Partos" → "Partos AI" are two distinct real companies
+and two distinct alias keys — the transcript drops a different piece of each name,
+not a typo in this table. "Fuse Finance" was also tested live and confirmed as a
+genuinely non-existent deal — correctly stays unmatched, no alias needed.) This is a
+living list — see the
 maintenance comment directly above `COMPANY_NAME_ALIASES` in the source file before
 adding a new entry.
 

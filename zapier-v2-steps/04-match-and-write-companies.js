@@ -116,7 +116,8 @@ const COMPANY_NAME_ALIASES = {
   openfx: "OpenFx", // confirmed 2026-08-29
   polymarket: "Polymarket", // confirmed 2026-08-29
   weeble: "WeBull", // confirmed 2026-08-29
-  paros: "Partos" // confirmed 2026-08-29
+  paros: "Partos", // confirmed 2026-08-29
+  partos: "Partos AI" // confirmed 2026-08-29 via direct lookup ("Socure - Partos AI") — distinct from the "paros" entry above (transcript drops the "t"); this one drops "AI"
 };
 
 // Lowercase + trim + strip ALL internal whitespace (not just collapse runs down to a

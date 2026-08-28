@@ -142,8 +142,10 @@ Real Claude enrichment output surfaced confirmed mismatches too large for
 punctuation/case tolerance to safely catch: `"PayMeadow"`/`"Pay Meadow"` (any
 spacing) → `"Paymitto"`, `"Valera"` → `"Velera"`, `"Green Sky"` → `"Greensky"`,
 `"Open FX"` → `"OpenFx"`, `"Poly Market"` → `"Polymarket"`, `"Weeble"` → `"WeBull"`,
-`"Paros"` → `"Partos"`. (`"Fuse Finance"` was also tested and confirmed as a
-genuinely non-existent deal — correctly stays unmatched, no alias needed.)
+`"Paros"` → `"Partos"`, `"Partos"` → `"Partos AI"` (two distinct real companies and
+alias keys — the transcript drops a different piece of each name). (`"Fuse
+Finance"` was also tested and confirmed as a genuinely non-existent deal —
+correctly stays unmatched, no alias needed.)
 `COMPANY_NAME_ALIASES` in `04-match-and-write-companies.js` (checked before the
 HubSpot search, falling through to the existing fuzzy match if no alias hits) is a
 living list — append a new entry whenever a new mismatch is confirmed, same
