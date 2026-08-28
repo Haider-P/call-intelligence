@@ -1,5 +1,10 @@
 # Call Intelligence v2 — Partner-Sync Pipeline (Zapier)
 
+> **Status (2026-08-29): fully built, wired, and validated end-to-end in Zapier —
+> still in DRAFT, not published**, pending a final go/no-go review. See "Current
+> Status" at the top of `../docs/zapier-v2-setup.md` for the full state, including
+> the known (non-blocking) minor gaps.
+
 Replaces the Pipedream architecture in `../pipedream-steps/` for a specific, narrower
 job: partner-sync calls (Socure, Zenoo, ZoomInfo, Signicat, Oscilar) that each discuss
 many end-customer companies in one call. The Pipedream pipeline assumed one call maps

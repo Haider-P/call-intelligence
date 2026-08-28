@@ -1,5 +1,55 @@
 # Zapier Setup Guide — Call Intelligence v2 (Partner-Sync Pipeline)
 
+## Current Status (2026-08-29)
+
+**Fully built and wired in Zapier.** All 9 core pipeline steps are live in the Zap
+builder:
+
+1. Schedule by Zapier (hourly trigger)
+2. Code by Zapier — Filter (`01-filter-partner-calls.js`)
+3. Looping by Zapier — the one outer loop, over `candidateCalls`
+4. Storage by Zapier → Get Value — dedup check (Step A below)
+5. Filter by Zapier — only continue if not already processed (Step B below)
+6. Code by Zapier — Transcript (`02-fetch-transcript.js`, Step C below)
+7. Code by Zapier — Enrichment (`03-claude-enrichment.js`, Step D below)
+8. Code by Zapier — Match + Write (`04-match-and-write-companies.js`, Step E below)
+9. Storage by Zapier → Set Value — dedup mark (Step G below)
+
+**Validated end-to-end against real production data.** Run live against the
+2026-08-26/27 Socure/Markaaz Partnership call, including a full dedup round-trip
+proof — the same call was correctly detected as already-processed on a second check,
+confirming steps 4, 5, and 9 above work together as designed in the live Zap, not
+just individually.
+
+**Status: DRAFT, not published — as of 2026-08-29.** This is a deliberate pause for a
+final confidence check, not an unfinished task. **What's needed before publishing:**
+essentially nothing technical. Every issue found during today's live testing
+(rate-limit throttling, the Haiku model swap, the `companiesJson` transport fix, the
+sentiment-casing fix, and the company-name matching aliases/root-causes) has been
+applied to the source, re-validated, and is already live in the Zap's Code steps.
+Publishing from here is a go/no-go judgment call for the pipeline owner, not a
+blocked technical task.
+
+### Known minor gaps (not blockers)
+
+- **`startTime` is not yet wired all the way through the chain end-to-end.**
+  Cosmetic — it doesn't affect matching, writes, or dedup correctness, only precision
+  of the `last_call_date` property on edge cases (falls back to "now" if missing, see
+  `writeCompanyUpdate()` in `04-match-and-write-companies.js`). Worth a pass to
+  confirm the field mapping at every step before publishing, but not a blocker.
+- **The original HubSpot rate-limit incident's specific `correlationId` values were
+  never retroactively added** to the "Why Phase 1 is throttled" evidence further
+  below — already flagged as a gap when that section was written (2026-08-28), not a
+  new finding today. The throttling fix doesn't depend on having them; they'd only
+  make the evidence trail more precise if ever revisited.
+- **The Digest by Zapier reporting layer (Zap 2, plus the optional unlisted-partner
+  flag branch documented below) was not part of today's confirmed build/test scope.**
+  The core 9-step pipeline above (trigger through dedup mark) is what's been
+  validated end-to-end. Confirm Zap 2 is actually wired and firing on a schedule
+  before relying on it for the run report.
+
+---
+
 Step-by-step guide to wiring `../zapier-v2-steps/*.js` into a real Zap. This is a
 multi-company pipeline (one call → many companies → many independent deal writes), so
 the wiring is more involved than the old Pipedream pipeline's single linear chain — read
