@@ -1,4 +1,15 @@
 /**
+ * SUPERSEDED — merged into 04-match-and-write-companies.js due to Zapier's
+ * no-nested-loops constraint ("You cannot turn on a Zap with more than one Looping by
+ * Zapier step", confirmed live 2026-08-28), see that date. This file assumed a second,
+ * nested "Looping by Zapier" step over each call's `companies` array, which Zapier does
+ * not support. Kept for reference only — not used in the live Zap. Its zapier-ready
+ * mirror (zapier-ready/05-write-deal-and-note.zapier.js) has been removed since it no
+ * longer matches the real Zap structure; see
+ * zapier-ready/04-match-and-write-companies.zapier.js instead.
+ */
+
+/**
  * ZAPIER STEP — WRITE: update the deal + add a note (Code by Zapier, "Run Javascript")
  * ----------------------------------------------------------------------------------------
  * Runs once per company, immediately after Deal Matching (04) in the same inner loop.

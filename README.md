@@ -105,8 +105,16 @@ call-intelligence/
 │   ├── 01-filter-partner-calls.js
 │   ├── 02-fetch-transcript.js
 │   ├── 03-claude-enrichment.js
-│   ├── 04-deal-matching.js
-│   ├── 05-write-deal-and-note.js
+│   ├── 04-match-and-write-companies.js  # ACTIVE — combined match+write, loops over
+│   │                                     # companies in plain JS (see below)
+│   ├── 04-deal-matching.js           # SUPERSEDED 2026-08-28 — kept for reference only
+│   ├── 05-write-deal-and-note.js     # SUPERSEDED 2026-08-28 — kept for reference only
+│   ├── zapier-ready/                 # Paste-into-Zapier-Code-editor mirrors of the
+│   │                                  # active files (inputData/return, not
+│   │                                  # process.env/output — see zapier-ready files'
+│   │                                  # own header comments)
+│   ├── tests/                        # Plain-Node tests (vm-harness pattern, no
+│   │                                  # framework/dependency) for the active files
 │   ├── .env.example
 │   └── README.md
 ├── docs/

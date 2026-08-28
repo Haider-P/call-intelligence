@@ -60,25 +60,35 @@ silently getting dropped as the partner roster grows. This deliberately over-fla
 without a sync keyword) — a false-positive flag costs a human one glance at a report
 row; a missed real partner call costs nothing being noticed until someone goes looking.
 
-## The 5 files
+## The live files
 
 | File | Zapier step type | Runs |
 |---|---|---|
 | `01-filter-partner-calls.js` | Code by Zapier | Once per hourly poll |
-| `02-fetch-transcript.js` | Code by Zapier | Once per matching call (outer loop) |
-| `03-claude-enrichment.js` | Code by Zapier | Once per matching call (outer loop) |
-| `04-deal-matching.js` | Code by Zapier | Once per extracted company (inner loop) |
-| `05-write-deal-and-note.js` | Code by Zapier | Once per extracted company (inner loop) |
+| `02-fetch-transcript.js` | Code by Zapier | Once per matching call (the one outer loop) |
+| `03-claude-enrichment.js` | Code by Zapier | Once per matching call (the one outer loop) |
+| `04-match-and-write-companies.js` | Code by Zapier | Once per matching call (the one outer loop) — internally loops over that call's extracted companies in plain JavaScript |
 
-Full wiring instructions, including the native (non-code) Storage by Zapier dedup step,
-the two nested Looping by Zapier steps, and the Digest by Zapier report, are in
-`../docs/zapier-v2-setup.md`.
+**Architecture corrected 2026-08-28: there is only one native "Looping by Zapier" step
+in this design**, over `candidateCalls`. An earlier version of this pipeline used
+`04-deal-matching.js` + `05-write-deal-and-note.js` as a second, nested loop over each
+call's companies — confirmed live that Zapier does not support this ("You cannot turn
+on a Zap with more than one Looping by Zapier step"). Those two files are kept in this
+folder marked SUPERSEDED, for reference only; `04-match-and-write-companies.js` merges
+their logic into one step that loops over companies in code instead. See "Why only one
+native loop" in `../docs/zapier-v2-setup.md` for the full rationale, and that same
+file's header comment for the timeout mitigations (parallel deal-matching, sequential
+writes, a soft time budget) the merge required.
+
+Full wiring instructions, including the native (non-code) Storage by Zapier dedup step
+and the Digest by Zapier report, are in `../docs/zapier-v2-setup.md`.
 
 ## What's written to HubSpot (4 deal properties, not the old 6)
 
 Same property set as the corrected Pipedream design (see `../README.md`), minus
-`next_step_date` — this design's Write step (05) only writes the 4 properties the task
-scope calls for:
+`next_step_date` — this design's write logic (in `04-match-and-write-companies.js`,
+ported unchanged from the superseded `05-write-deal-and-note.js`) only writes the 4
+properties the task scope calls for:
 
 | Property | Internal name |
 |---|---|
@@ -126,6 +136,15 @@ positives against unrelated calls. Covered by
 `zapier-v2-steps/tests/01-filter-partner-calls.test.js` (run with
 `node zapier-v2-steps/tests/01-filter-partner-calls.test.js`), including a regression
 check that an unrelated topic (`"Weekly Team Standup"`) still does not match.
+
+**Known company-name transcription gaps — RESOLVED 2026-08-28.** Real Claude enrichment
+output surfaced 3 confirmed mismatches too large for punctuation/case tolerance to
+safely catch: `"PayMeadow"` → `"Paymitto"`, `"Valera"` → `"Velera"`, `"Green Sky"` →
+`"Greensky"`. `COMPANY_NAME_ALIASES` in `04-match-and-write-companies.js` (checked
+before the HubSpot search, falling through to the existing fuzzy match if no alias
+hits) is a living list — append a new entry whenever a new mismatch is confirmed, same
+maintenance pattern as `SYNC_KEYWORD_ALIASES` above. Covered by
+`zapier-v2-steps/tests/04-match-and-write-companies.test.js`.
 
 `conversation_type: "video_conference"` (not `"phone_call"`, and not `"meeting"` —
 an earlier draft assumed a `"meeting"` enum value that doesn't exist in the real API)
