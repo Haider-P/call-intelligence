@@ -31,8 +31,44 @@
  *     companyName, sentiment, nextStep, unresolvedObjections, rawSummary, partner,
  *     startTime, hubspotAccessToken
  *   output: { matched, dealId, matchedDealName, companyName, sentiment, nextStep,
- *             unresolvedObjections, rawSummary, partner, startTime }
+ *             unresolvedObjections, rawSummary, partner, startTime, candidateCount,
+ *             reason }
+ *
+ * companyName is checked against COMPANY_NAME_ALIASES before searching HubSpot (see
+ * that map below) to catch known Claude-transcription mismatches (e.g. "PayMeadow"
+ * -> "Paymitto") that are too large a gap for the normalize()-based tolerance to
+ * safely catch. reason is null when matched, otherwise flags a possible
+ * transcription mismatch for manual review — see the `reason` assignment near the
+ * bottom of this file.
  */
+
+// Known company-name transcription mismatches, confirmed from real Claude enrichment
+// output against live call transcripts (e.g. "PayMeadow" extracted for the actual
+// customer "Paymitto" on the 2026-08-26 Socure/Markaaz Partnership call). These gaps
+// are too large for normalize()'s case/punctuation/whitespace tolerance below to
+// safely catch — widening that further (e.g. edit-distance fuzzing) risks false
+// positives across unrelated companies, which is exactly why this alias map exists as
+// the first-line fix instead.
+//
+// LIVING LIST: append a new entry here whenever a new transcription mismatch is
+// confirmed against a real company/deal — same maintenance pattern as
+// SYNC_KEYWORD_ALIASES in 01-filter-partner-calls.js. Keys must be normalized via
+// normalizeCompanyKey() below (lowercase, trimmed, whitespace-collapsed) so a lookup
+// matches regardless of how the alias happens to be capitalized/spaced.
+const COMPANY_NAME_ALIASES = {
+  paymeadow: "Paymitto", // confirmed 2026-08-28, Socure/Markaaz Partnership call
+  valera: "Velera", // confirmed 2026-08-28, Socure/Markaaz Partnership call
+  "green sky": "Greensky" // confirmed 2026-08-28, Socure/Markaaz Partnership call
+};
+
+// Lowercase + trim + collapse whitespace — used only to key into
+// COMPANY_NAME_ALIASES, so "Green Sky", "green sky", and "  Green   Sky " all hit the
+// same "green sky" alias regardless of case or spacing. Distinct from normalize()
+// below, which additionally strips punctuation for comparing against real HubSpot
+// deal names once a company name (aliased or not) is being searched for.
+function normalizeCompanyKey(str) {
+  return (str || "").toLowerCase().trim().replace(/\s+/g, " ");
+}
 
 function normalize(str) {
   return (str || "")
@@ -71,12 +107,19 @@ if (!token) {
   throw new Error("hubspotAccessToken is missing from inputData — map it in this step's Input Data panel");
 }
 
-const companyName = inputData.companyName;
+const rawCompanyName = inputData.companyName;
 const partner = inputData.partner;
 
-if (!companyName || !partner) {
+if (!rawCompanyName || !partner) {
   throw new Error("Missing companyName or partner in inputData");
 }
+
+// Alias map is checked first — it's the first-line fix for transcription gaps too
+// large for normalize()'s tolerance to safely catch (see COMPANY_NAME_ALIASES
+// comment above). Falls through to the existing normalize()-based search unchanged
+// when no alias hits, exactly as before this change.
+const aliasedCompanyName = COMPANY_NAME_ALIASES[normalizeCompanyKey(rawCompanyName)];
+const companyName = aliasedCompanyName || rawCompanyName;
 
 const targetDealName = `${partner} - ${companyName}`;
 const targetNormalized = normalize(targetDealName);
@@ -104,6 +147,14 @@ if (exactMatches.length === 1) {
   matched = false;
 }
 
+// Surfaces in this step's own Zapier run output regardless of what any downstream
+// step does with it — so a human scanning run history can spot a recurring
+// transcription gap and add it to COMPANY_NAME_ALIASES, instead of the same real
+// company silently failing to match on every future call.
+const reason = matched
+  ? null
+  : "no matching deal found — possible transcription mismatch: consider adding to COMPANY_NAME_ALIASES if this is a recurring real company";
+
 return {
   matched,
   dealId,
@@ -115,5 +166,6 @@ return {
   rawSummary: inputData.rawSummary,
   partner,
   startTime: inputData.startTime,
-  candidateCount: exactMatches.length
+  candidateCount: exactMatches.length,
+  reason
 };
