@@ -5,8 +5,11 @@
  *   node zapier-v2-steps/tests/04-match-and-write-companies.test.js
  *
  * Runs the real source text unmodified inside a vm context with a mocked `fetch`,
- * `inputData`, and (only for the timeout scenario) a controllable `Date.now()`, then
- * reads back the `output` global the script sets.
+ * `inputData`, a mocked `setTimeout` (see fakeSetTimeout below — no test in this file
+ * ever waits any real wall-clock time, including the batch-throttling tests), and
+ * (only for the timeout scenario) a controllable `Date.now()`, then reads back the
+ * `output` global the script sets, plus `delayCalls` and `searchWaveLog` for asserting
+ * on Phase 1's batch-throttling behavior.
  */
 
 const fs = require("fs");
@@ -67,18 +70,47 @@ function makeControllableDate(nowSequence) {
   return ControllableDate;
 }
 
+// Fakes the batch-throttling delay: records the requested ms (so tests can assert on
+// SEARCH_BATCH_DELAY_MS without knowing the constant's value ahead of time) and
+// bumps `currentWave` so fetch calls made after this point are attributed to the next
+// batch — but resolves on a microtask instead of a real timer, so no test ever
+// actually waits.
+function makeFakeSetTimeout(delayCalls, bumpWave) {
+  return function fakeSetTimeout(fn, ms) {
+    delayCalls.push(ms);
+    bumpWave();
+    Promise.resolve().then(fn);
+    return 0;
+  };
+}
+
 async function runStep(inputDataFields, { dateNowSequence } = {}) {
+  const delayCalls = [];
+  const searchWaveLog = []; // { query, wave } — one entry per HubSpot search call
+  let currentWave = 0;
+
+  function fetchWithWaveTracking(url, opts) {
+    if (url.includes("/deals/search") && opts.method === "POST") {
+      const body = JSON.parse(opts.body);
+      searchWaveLog.push({ query: body.query, wave: currentWave });
+    }
+    return mockFetch(url, opts);
+  }
+
   const sandbox = {
     process: { env: { HUBSPOT_ACCESS_TOKEN: "test-token" } },
     inputData: inputDataFields,
     console,
-    fetch: mockFetch,
+    fetch: fetchWithWaveTracking,
+    setTimeout: makeFakeSetTimeout(delayCalls, () => {
+      currentWave++;
+    }),
     Date: dateNowSequence ? makeControllableDate(dateNowSequence) : Date
   };
   vm.createContext(sandbox);
   const wrapped = `(async () => {\n${source}\n})()`;
   await vm.runInContext(wrapped, sandbox, { filename: SOURCE_PATH });
-  return sandbox.output;
+  return { output: sandbox.output, delayCalls, searchWaveLog };
 }
 
 function company(companyName, overrides = {}) {
@@ -104,7 +136,7 @@ async function main() {
       company("US Bank"), // fuzzy (normalize()) -> "U.S. Bank"
       company("Totally Unknown Company Inc") // no match
     ];
-    const output = await runStep({
+    const { output, delayCalls } = await runStep({
       companiesJson: JSON.stringify(companies),
       partner: "Socure",
       startTime: "2026-08-28T10:00:00Z"
@@ -116,6 +148,7 @@ async function main() {
     assert.strictEqual(output.companiesNoMatch, 1);
     assert.strictEqual(output.companiesSkippedTimeout, 0);
     assert.strictEqual(output.companiesErrored, 0);
+    assert.strictEqual(delayCalls.length, 0, "3 companies fit in a single batch (SEARCH_BATCH_SIZE=3) — no throttling delay needed");
 
     const [r1, r2, r3] = output.results;
     assert.strictEqual(r1.status, "written");
@@ -153,7 +186,7 @@ async function main() {
     // 1st Date.now() call = startedAt (0). 2nd call = the budget check before company
     // 0 (small elapsed, proceeds). 3rd call = the budget check before company 1
     // (elapsed now reads past the 25000ms budget, so the loop stops there).
-    const output = await runStep(
+    const { output } = await runStep(
       { companiesJson: JSON.stringify(companies), partner: "Socure", startTime: "2026-08-28T10:00:00Z" },
       { dateNowSequence: [0, 1000, 30000] }
     );
@@ -178,7 +211,7 @@ async function main() {
   // still function so this file stays directly testable without JSON round-tripping.
   {
     const companies = [company("PayMeadow")];
-    const output = await runStep({ companies, partner: "Socure", startTime: "2026-08-28T10:00:00Z" });
+    const { output } = await runStep({ companies, partner: "Socure", startTime: "2026-08-28T10:00:00Z" });
 
     assert.strictEqual(output.results.length, 1);
     assert.strictEqual(output.results[0].status, "written");
@@ -236,6 +269,49 @@ async function main() {
     );
 
     console.log("PASS: malformed companiesJson throws a clear, field-specific parse error");
+  }
+
+  // Batch throttling (added 2026-08-28 after a live dry run got 429'd firing all
+  // searches for a 14-company call at once via an unthrottled Promise.all — see
+  // SEARCH_BATCH_SIZE/SEARCH_BATCH_DELAY_MS in the source file). 7 companies with
+  // SEARCH_BATCH_SIZE=3 should split into batches of [3, 3, 1] with a delay between
+  // each of the first two batches (none after the last, since there's nothing left
+  // to throttle).
+  {
+    const companies = [
+      company("Company A"),
+      company("Company B"),
+      company("Company C"),
+      company("Company D"),
+      company("Company E"),
+      company("Company F"),
+      company("Company G")
+    ];
+    const { output, delayCalls, searchWaveLog } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    // All 7 are unknown companies (not in HUBSPOT_DEALS) -- correctness of matching
+    // isn't the point here, batching timing is; still confirm nothing was dropped.
+    assert.strictEqual(output.results.length, 7);
+    assert.strictEqual(output.companiesProcessed, 7);
+    assert.strictEqual(output.companiesNoMatch, 7);
+
+    assert.strictEqual(delayCalls.length, 2, "3 batches (of 3, 3, 1) means exactly 2 between-batch delays");
+    assert.deepStrictEqual(
+      Array.from(delayCalls),
+      [1000, 1000],
+      "each delay should be SEARCH_BATCH_DELAY_MS (1000ms), not shortened for the smaller final batch"
+    );
+
+    // Confirm the searches actually landed in 3 waves of sizes [3, 3, 1], not just
+    // that 2 delays happened somewhere unrelated.
+    const waveSizes = [0, 1, 2].map((wave) => searchWaveLog.filter((entry) => entry.wave === wave).length);
+    assert.deepStrictEqual(Array.from(waveSizes), [3, 3, 1], "searches should batch into groups of [3, 3, 1], not fire all at once or one at a time");
+
+    console.log("PASS: 7 companies throttle into 3 batches of [3, 3, 1] with a 1000ms delay between each");
   }
 
   console.log("\nAll tests passed.");

@@ -44,16 +44,34 @@
  * writes (property PATCH + note POST) — up to 40+ sequential API calls in the worst
  * case. Two mitigations, both below:
  *
- *   1. PARALLEL READS, SEQUENTIAL WRITES. Phase 1 (deal matching) is read-only and
- *      independent per company, so all companies are matched concurrently via
- *      Promise.all. Phase 2 (writes) stays sequential, one company at a time — not
- *      parallelized, to avoid firing concurrent writes at HubSpot for potentially-
- *      related records.
+ *   1. THROTTLED PARALLEL READS, SEQUENTIAL WRITES. Phase 1 (deal matching) is
+ *      read-only and independent per company, so companies are matched in small
+ *      concurrent batches (see SEARCH_BATCH_SIZE / SEARCH_BATCH_DELAY_MS below) rather
+ *      than sequentially one at a time. This was originally a single unthrottled
+ *      Promise.all over every company at once — confirmed live 2026-08-28 that this
+ *      hits HubSpot's real CRM Search API rate limit (5 requests/second per account,
+ *      per HubSpot's own docs): a 14-company dry run firing all 14 searches at once
+ *      got 429s (HubSpot's "SECONDLY" rate-limit category) on 10 of the 14. The batched
+ *      version stays safely under that limit with margin — see the comment on those
+ *      constants for the exact numbers and reasoning. Phase 2 (writes) stays fully
+ *      sequential, one company at a time — property PATCHes and note POSTs are NOT
+ *      batched/parallelized at all, to avoid firing concurrent writes at HubSpot for
+ *      potentially-related records (this is the actual bottleneck phase, and the
+ *      slower/safer tradeoff is intentional here, not an oversight — and it wasn't
+ *      implicated in the 429s, so it isn't touched by this throttling fix).
  *   2. SOFT TIME BUDGET. SOFT_TIME_BUDGET_MS (~25s) is checked before each company's
- *      write in Phase 2, measured from the top of the whole step. If exceeded, the loop
- *      stops immediately. Every company never reached is explicitly recorded with
- *      status "skipped-timeout" — NOT folded into "no matching deal found" — so a
- *      partial run is diagnosable rather than silently incomplete.
+ *      write in Phase 2, measured from the top of the whole step (covers Phase 1 too,
+ *      including the batch delays now built into it — see note on that constant).
+ *      If exceeded, the loop stops immediately — no further companies are attempted.
+ *      Every company never reached is explicitly recorded with
+ *      status "skipped-timeout" and reason "skipped — time budget exceeded, not
+ *      attempted" — NOT folded into "no matching deal found" — so a partial run is
+ *      diagnosable (which companies were actually attempted vs. never reached) rather
+ *      than silently incomplete. Throttling Phase 1 makes this path more likely to
+ *      trigger on calls with a large company count than before — that's an accepted,
+ *      already-tested tradeoff (see the constant's comment), not a regression to fix
+ *      by shrinking the budget further, which would just make MORE calls hit this path
+ *      without buying real safety against Zapier's 30s hard cutoff.
  *
  * Zapier wiring:
  *   Step type: Code by Zapier → "Run Javascript"
@@ -300,11 +318,83 @@ function resolveCompanies(inputData) {
   );
 }
 
+// ---- Throttled batch matching (HubSpot Search API rate limit) --------------------
+
+// HubSpot's CRM Search API (used by searchHubSpotDeals above) is rate limited to
+// 5 requests/second per account — confirmed via HubSpot's own docs
+// (developers.hubspot.com/docs/api-reference/latest/crm/search-the-crm, "Limits"
+// section: "The search endpoints are rate limited to five requests per second per
+// account."). This is a separate, more restrictive limit than HubSpot's general
+// 100-requests/10-seconds API limit, and it's account-wide — not per-integration.
+//
+// A live dry run confirmed hitting it directly: the original design fired every
+// company's search concurrently via a single Promise.all (no batching at all). For
+// a 14-company call, that's 14 simultaneous search requests — 10 of the 14 came back
+// 429, HubSpot's "SECONDLY" rate-limit category, in one real test run.
+//
+// SEARCH_BATCH_SIZE / SEARCH_BATCH_DELAY_MS below throttle this to 3 requests
+// every 1000ms — a sustained 3 req/s, ~40% margin under HubSpot's 5 req/s limit
+// (the delay is measured from the START of one batch to the START of the next, so
+// a batch's 3 near-simultaneous requests plus the next batch's 3 never land in the
+// same 1-second window). Since "Looping by Zapier" processes the outer loop's calls
+// one at a time — never concurrently — this step's own batching is the only source
+// of concurrent HubSpot search traffic to budget for; no cross-call coordination is
+// needed.
+//
+// Trade-off: this adds real wall-clock time to Phase 1 that wasn't there before
+// (SEARCH_BATCH_DELAY_MS between every batch), which eats into the soft time budget
+// below. A call with a large company count is now more likely to hit the
+// "skipped-timeout" path than before this fix — that's an accepted, already-tested
+// degradation path (see SOFT_TIME_BUDGET_MS's comment), not a bug: correctness
+// (not getting 429'd, not silently dropping company results) took priority over
+// speed here.
+const SEARCH_BATCH_SIZE = 3;
+const SEARCH_BATCH_DELAY_MS = 1000;
+
+function delay(ms) {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+// Matches every company's deal in small concurrent batches instead of one big
+// Promise.all — see the constants above for the rate-limit reasoning. Each entry is
+// individually .catch()-guarded, same as before, so one company's search failure
+// can't drop any other company's result (within its batch or any other).
+async function matchCompaniesThrottled(token, partner, companies) {
+  const matchResults = [];
+
+  for (let i = 0; i < companies.length; i += SEARCH_BATCH_SIZE) {
+    const batch = companies.slice(i, i + SEARCH_BATCH_SIZE);
+
+    const batchResults = await Promise.all(
+      batch.map((company) =>
+        matchCompanyDeal(token, partner, company.companyName).catch((err) => ({
+          companyName: company.companyName,
+          matched: false,
+          dealId: null,
+          matchedDealName: null,
+          candidateCount: 0,
+          reason: `deal search failed: ${err.message}`,
+          searchError: true
+        }))
+      )
+    );
+    matchResults.push(...batchResults);
+
+    const isLastBatch = i + SEARCH_BATCH_SIZE >= companies.length;
+    if (!isLastBatch) {
+      await delay(SEARCH_BATCH_DELAY_MS);
+    }
+  }
+
+  return matchResults;
+}
+
 // ---- Main: one call's worth of companies, processed in plain JS ------------------
 
 // ~25s soft budget, leaving ~5s margin before Zapier's 30s hard Code-step cutoff.
-// Measured from the very top of this step (below), so it covers both the parallel
-// matching phase and the sequential write phase — not just the write loop.
+// Measured from the very top of this step (below), so it covers both the throttled
+// matching phase (including its batch delays, see SEARCH_BATCH_DELAY_MS above) and
+// the sequential write phase — not just the write loop.
 const SOFT_TIME_BUDGET_MS = 25000;
 
 const token = inputData.hubspotAccessToken;
@@ -322,24 +412,11 @@ if (!partner) {
 
 const startedAt = Date.now();
 
-// Phase 1: match every company's deal in parallel. Deal search is read-only, so
-// there's no rate-limit/consistency risk in firing all of these concurrently — this
-// collapses what would be up to N sequential search round-trips into roughly one.
-// Each entry is individually .catch()-guarded so one company's search failure can't
-// reject the whole Promise.all and drop every other company's match result.
-const matchResults = await Promise.all(
-  companies.map((company) =>
-    matchCompanyDeal(token, partner, company.companyName).catch((err) => ({
-      companyName: company.companyName,
-      matched: false,
-      dealId: null,
-      matchedDealName: null,
-      candidateCount: 0,
-      reason: `deal search failed: ${err.message}`,
-      searchError: true
-    }))
-  )
-);
+// Phase 1: match every company's deal, throttled in small batches (see
+// matchCompaniesThrottled() and the SEARCH_BATCH_SIZE/SEARCH_BATCH_DELAY_MS comment
+// above) to stay under HubSpot's real 5 req/s CRM Search API rate limit — the
+// original single unthrottled Promise.all here got 429'd on a live 14-company call.
+const matchResults = await matchCompaniesThrottled(token, partner, companies);
 
 // Phase 2: process sequentially, one company at a time. Writes (property PATCH + note
 // POST) touch live HubSpot records — kept sequential rather than parallelized, unlike

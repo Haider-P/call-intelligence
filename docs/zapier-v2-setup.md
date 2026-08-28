@@ -144,6 +144,47 @@ behavior. If a future field mapping mistake reintroduces this (e.g. someone maps
 Output again out of habit), Step E's error message names both fields it checked
 (`companiesJson`, `companies`) so it's fast to diagnose rather than a silent failure.
 
+**Why Phase 1 (deal matching) is throttled, not fully parallel.** Step E's own header
+comment covers this in detail; the short version for wiring purposes: a live dry run
+(2026-08-28) confirmed that firing all of a call's HubSpot deal searches at once via
+an unthrottled `Promise.all` — the original Phase 1 design — hits a real limit.
+**Evidence:** a 14-company call fired 14 simultaneous `POST
+/crm/v3/objects/deals/search` requests; 10 of the 14 came back HTTP 429, HubSpot's
+"SECONDLY" rate-limit category (`Traffic.SECONDLY` in the response body's
+`subCategory`; specific `correlationId` values from that run were not preserved —
+capture and add them here if you have them in Zapier's task history or HubSpot's own
+error logs, for a future adjustment to cite directly). This lines up with HubSpot's
+own published limit: **the CRM Search API is rate limited to 5 requests/second per
+account** (confirmed via
+[developers.hubspot.com/docs/api-reference/latest/crm/search-the-crm](https://developers.hubspot.com/docs/api-reference/latest/crm/search-the-crm),
+"Limits" section) — a separate, more restrictive limit than HubSpot's general
+100-requests/10-seconds API limit, and account-wide (not scoped per integration or
+per Zap). Step E now batches deal searches at `SEARCH_BATCH_SIZE = 3` companies per
+batch, with a `SEARCH_BATCH_DELAY_MS = 1000` (1 second) delay between the start of
+each batch — a sustained 3 requests/second, ~40% margin under HubSpot's 5 req/s
+limit. Phase 2 (property writes + notes) was **not** touched by this fix — it was
+already fully sequential (one company at a time) and wasn't implicated in the 429s.
+**If you ever need to retune these constants** (e.g. HubSpot raises the limit, or a
+different rate-limit category shows up), change `SEARCH_BATCH_SIZE` /
+`SEARCH_BATCH_DELAY_MS` at the top of the "Throttled batch matching" section in
+`04-match-and-write-companies.js` — don't just revert to an unthrottled `Promise.all`,
+that's exactly what caused this.
+
+**Knock-on effect on the soft time budget.** The batch delays add real wall-clock
+time to Phase 1 that wasn't there before (up to several seconds for a large company
+count — e.g. a 14-company call now takes ~4 seconds of pure batch-delay time across 4
+between-batch waits, on top of actual request latency). `SOFT_TIME_BUDGET_MS` (~25s)
+was deliberately left unchanged rather than shrunk further — shrinking it would just
+make *more* calls hit the `"skipped-timeout"` path without buying any real protection
+against Zapier's 30s hard cutoff, since 25s already carries a ~5s margin against that.
+Practically: **expect `companiesSkippedTimeout` to show up more often now on calls
+with a large company count than it did before this throttling fix** — that's an
+accepted trade-off (correctness over speed), not a regression. The
+`"skipped-timeout"` degradation path itself is unchanged and was re-verified against
+this exact change (see `zapier-v2-steps/tests/04-match-and-write-companies.test.js`)
+— it still stops cleanly and labels every unattempted company correctly, it just may
+trigger at a somewhat lower company-count threshold than before.
+
 **Making `results` readable in the digest.** `results` is an array of objects
 (`{ companyName, status, dealId, noteId, updatedProperties, reason, ... }` — see Step
 E's header comment for the full shape). Digest by Zapier fields generally expect
@@ -204,6 +245,11 @@ Digest by Zapier needs a separate scheduled release. Set this up as its own tiny
       `04-match-and-write-companies.js` did its job (no crash, clean partial result) but
       the batch is genuinely too large for one Code step run — see that file's header
       comment for the built-in mitigations before changing anything.
+- [ ] On that same large-company-count run, confirm no `results` entry's `reason`
+      mentions a `429` or rate limit — this is what the Phase 1 batching
+      (`SEARCH_BATCH_SIZE` / `SEARCH_BATCH_DELAY_MS`) exists to prevent (see "Why
+      Phase 1 is throttled" above). If it shows up, do not just re-widen batches to
+      save time without re-checking HubSpot's current published Search API limit first.
 - [ ] Confirm re-running the same call a second time (simulating a re-poll) is skipped
       by the Storage by Zapier dedup check and does not duplicate notes or overwrite
       properties again
@@ -223,6 +269,7 @@ Digest by Zapier needs a separate scheduled release. Set this up as its own tiny
 | A company's `results` entry says "no matching deal found" for a deal you know exists | Check the deal name is exactly `{Partner} - {Company}`. The matcher tolerates punctuation/case variance (e.g. "US Bank" vs "U.S. Bank") via `normalize()`, and known transcription mismatches (e.g. "PayMeadow" vs "Paymitto") via `COMPANY_NAME_ALIASES` — if it's a recurring real company hitting a transcription gap, add it to that map (see the living-list comment above it in `04-match-and-write-companies.js`) rather than widening the fuzzy-match tolerance. |
 | A company's `results` entry has `status: "skipped-timeout"` | The call's company count was too large to finish inside Zapier's 30s Code-step limit even with parallel matching + a soft budget. Check `companiesSkippedTimeout` in Step E's output — those companies were never attempted (not a false "no match"). No automatic retry exists yet; re-running the call (once the Storage dedup key is cleared) will reprocess all its companies from scratch, including ones already written on the prior partial run — check `results` from the prior run before manually re-triggering. |
 | A company's `results` entry has `status: "error"` | An unexpected HubSpot failure (network blip, transient 5xx) on that one company's search or write — check the entry's `reason` for the underlying error. Per-company try/catch means this does not abort the rest of the call's companies (see `companiesErrored` in Step E's header comment for why this exists in the merged single-step design). |
+| A company's `results` entry has `reason` containing `429` / mentions a rate limit | Deal-search throttling wasn't enough for this run's request pattern — check `SEARCH_BATCH_SIZE` / `SEARCH_BATCH_DELAY_MS` in `04-match-and-write-companies.js` are still what they should be (3 companies / 1000ms, ~3 req/s, under HubSpot's published 5 req/s CRM Search API limit — see "Why Phase 1 is throttled" above). If someone tightened the delay or widened the batch size to save time, that's the likely cause — revert, don't remove throttling entirely. |
 | Step E throws `"No companies array found in inputData"` | You mapped Step D's "Step Output {...}" (or the `companies` field) into Step E's `companiesJson` input instead of Step D's dedicated **"Companies Json"** output field. Zapier's Step Output picker stringifies the whole upstream object, not just the nested array — re-map to the specific `companiesJson` field. See the "Field mapping gotcha" callout above. |
 | Step E throws `"inputData.companiesJson could not be parsed as JSON"` | `companiesJson` is present but isn't valid JSON — most likely something other than Step D's `companiesJson` output got mapped there (e.g. `topic` or `transcriptText`). Check the field mapping. |
 | Same call processed twice | Confirm Step G (Storage Set Value) is actually wired after Step E, and Step A/B (Storage Get + Filter) are wired before Step C in every run |
