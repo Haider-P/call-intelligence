@@ -32,12 +32,20 @@
  *   Step type: Code by Zapier → "Run Javascript"
  *   inputData: transcriptText, partner, topic, startTime (from Step 2's output),
  *     anthropicApiKey
- *   output: { companies: [...], partner, startTime, companyCount }
+ *   output: { companies: [...], companiesJson, partner, startTime, companyCount }
  *
- * companies feeds Step 4 (04-match-and-write-companies.js) directly — that step loops
- * over `companies` internally in plain JavaScript, not via a second "Looping by
- * Zapier" step (Zapier does not support more than one per Zap; see "Why only one
- * native loop" in ../../docs/zapier-v2-setup.md).
+ * companiesJson feeds Step 4 (04-match-and-write-companies.js) directly — map THIS
+ * field (a plain string pill in Zapier's data picker), not Step Output {...} and not
+ * the `companies` array field, to Step 4's companiesJson input. Zapier's "Step Output
+ * {...}" picker serializes the step's ENTIRE output object when mapped into a
+ * downstream field — confirmed live, mapping it to `companies` produced the whole
+ * output object stringified instead of just the array, and Step 4 failed with
+ * "No companies array in inputData". companiesJson exists specifically so Step 4 can
+ * map one unambiguous string field and JSON.parse() it explicitly — see that file's
+ * resolveCompanies() and ../../docs/zapier-v2-setup.md for the full explanation. That
+ * step loops over the parsed array internally in plain JavaScript, not via a second
+ * "Looping by Zapier" step (Zapier does not support more than one per Zap; see "Why
+ * only one native loop" in ../../docs/zapier-v2-setup.md).
  */
 
 function buildPrompt(transcriptText, partner) {
@@ -147,6 +155,15 @@ const companies = parsedCompanies
 
 return {
   companies,
+  // Zapier-safe transport field — see the note on this in
+  // 04-match-and-write-companies.zapier.js and ../../docs/zapier-v2-setup.md.
+  // Zapier's "Step Output {...}" data-picker inserts an ENTIRE step's output as one
+  // stringified object when mapped into a downstream Input Data field, not just one
+  // nested array — confirmed live, mapping Step Output to `companies` produced the
+  // whole { companies, partner, startTime, companyCount } object stringified, not
+  // the array alone, and Step 4 failed with "No companies array in inputData". Map
+  // THIS field (a plain string pill) to Step 4's companiesJson input instead.
+  companiesJson: JSON.stringify(companies),
   partner,
   startTime: inputData.startTime,
   companyCount: companies.length

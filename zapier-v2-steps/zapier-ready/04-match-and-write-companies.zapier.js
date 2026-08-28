@@ -7,7 +7,7 @@
  *
  *   1. The HubSpot token is read from `inputData.hubspotAccessToken` instead of
  *      `process.env.HUBSPOT_ACCESS_TOKEN` — map it in this step's Input Data panel
- *      alongside `companies`, `partner`, `startTime` below.
+ *      alongside `companiesJson`, `partner`, `startTime` below.
  *   2. The step ends with `return {...}` instead of assigning to the bare `output`
  *      global.
  *
@@ -28,8 +28,16 @@
  * native loop over that call's companies is not available.
  *
  * FIX: this single step runs once per call (inside the one remaining outer loop) and
- * loops over `inputData.companies` itself, in plain JavaScript (`for...of`), instead of
+ * loops over the companies array itself, in plain JavaScript (`for...of`), instead of
  * a second Zapier-level loop.
+ *
+ * FIELD MAPPING GOTCHA — the companies array must come in via `inputData.companiesJson`
+ * (a JSON string), not `inputData.companies` directly. Zapier's "Step Output {...}"
+ * data-picker inserts an ENTIRE step's output as one stringified object when mapped
+ * into a downstream Input Data field, not just one nested array within it — confirmed
+ * live, mapping Step Output to `companies` produced the whole Step 3 output object
+ * stringified, not the array alone, and this step failed with "No companies array in
+ * inputData". See resolveCompanies() below for the fix and the fallback order.
  *
  * TIMEOUT RISK — Zapier's standard Code step has a hard 30-second limit. A single call
  * can have 14+ companies, each needing 1 HubSpot search (match) + up to 2 HubSpot
@@ -49,8 +57,9 @@
  *
  * Zapier wiring:
  *   Step type: Code by Zapier → "Run Javascript"
- *   inputData: companies (array, mapped from Step 3/enrichment's output), partner,
- *     startTime, hubspotAccessToken
+ *   inputData: companiesJson (string, from Step 3/enrichment's dedicated
+ *     "Companies Json" output field — NOT Step Output {...}, see the field-mapping
+ *     gotcha above), partner, startTime, hubspotAccessToken
  *   output: { results: [...], companiesProcessed, companiesMatched, companiesNoMatch,
  *             companiesSkippedTimeout, companiesErrored, partner, startTime }
  *
@@ -251,6 +260,46 @@ ${rawSummary}`;
   return { updatedProperties: Object.keys(properties), noteId };
 }
 
+// ---- Reading the companies array (Zapier field-mapping gotcha) -------------------
+
+// Zapier's "Step Output {...}" data-picker inserts an ENTIRE step's output as one
+// stringified object when mapped into a downstream Input Data field, not just one
+// nested array field within it — confirmed live: mapping Step 3's Step Output to
+// `companies` here resulted in inputData.companies being the FULL Step 3 output
+// object stringified (partner + startTime + companies all together), not the
+// companies array alone, causing "No companies array in inputData" below.
+//
+// Fix: Step 3 (03-claude-enrichment.js) now also outputs `companiesJson` — a
+// dedicated JSON string of JUST the companies array, a plain string pill in
+// Zapier's field picker with no array-vs-object-vs-string ambiguity. That's the
+// primary path here. inputData.companies (a genuine array, e.g. from this repo's
+// own tests, or if Zapier's picker behavior ever changes) is a secondary fallback,
+// not the primary path — don't rely on it in the live Zap wiring.
+function resolveCompanies(inputData) {
+  if (inputData.companiesJson !== undefined && inputData.companiesJson !== null) {
+    let parsed;
+    try {
+      parsed = JSON.parse(inputData.companiesJson);
+    } catch (err) {
+      throw new Error(`inputData.companiesJson could not be parsed as JSON: ${err.message}`);
+    }
+    if (Array.isArray(parsed)) {
+      return parsed;
+    }
+  }
+
+  if (Array.isArray(inputData.companies)) {
+    return inputData.companies;
+  }
+
+  throw new Error(
+    "No companies array found in inputData — checked inputData.companiesJson (parsed as JSON) " +
+      "and inputData.companies (as a genuine array); neither yielded one. Check the Step 3 -> " +
+      "Step 4 field mapping: map Step 3's \"Companies Json\" output field to companiesJson here, " +
+      "not Step Output {...} (which stringifies the whole Step 3 output object, not just the array)."
+  );
+}
+
 // ---- Main: one call's worth of companies, processed in plain JS ------------------
 
 // ~25s soft budget, leaving ~5s margin before Zapier's 30s hard Code-step cutoff.
@@ -263,10 +312,7 @@ if (!token) {
   throw new Error("hubspotAccessToken is missing from inputData — map it in this step's Input Data panel");
 }
 
-const companies = inputData.companies;
-if (!Array.isArray(companies)) {
-  throw new Error("No companies array in inputData — check Step 3 (enrichment)'s field mapping");
-}
+const companies = resolveCompanies(inputData);
 
 const partner = inputData.partner;
 const startTime = inputData.startTime;

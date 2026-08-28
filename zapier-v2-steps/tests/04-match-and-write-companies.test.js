@@ -94,13 +94,21 @@ function company(companyName, overrides = {}) {
 
 async function main() {
   // Multiple companies in one call: alias match, fuzzy match, no-match, all together.
+  // Primary path: companiesJson (a JSON string), NOT the companies array directly —
+  // this is how Step 3 actually feeds Step 4 in the live Zap, since Zapier's "Step
+  // Output {...}" picker can't be mapped to just the nested array (see
+  // resolveCompanies() in the source file).
   {
     const companies = [
       company("PayMeadow"), // alias -> Paymitto
       company("US Bank"), // fuzzy (normalize()) -> "U.S. Bank"
       company("Totally Unknown Company Inc") // no match
     ];
-    const output = await runStep({ companies, partner: "Socure", startTime: "2026-08-28T10:00:00Z" });
+    const output = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
 
     assert.strictEqual(output.results.length, 3);
     assert.strictEqual(output.companiesProcessed, 3);
@@ -133,19 +141,20 @@ async function main() {
       "no-match reason should flag possible transcription mismatch"
     );
 
-    console.log("PASS: multiple companies (alias match + fuzzy match + no-match) processed correctly in one call");
+    console.log("PASS: multiple companies (alias match + fuzzy match + no-match) processed correctly via companiesJson (primary path)");
   }
 
   // Time-budget-exceeded: force the soft-budget check to trip after the first
   // company, confirming remaining companies are cleanly labeled skipped-timeout
-  // rather than crashing or being silently dropped.
+  // rather than crashing or being silently dropped. Also uses companiesJson, same as
+  // the live wiring.
   {
     const companies = [company("PayMeadow"), company("US Bank"), company("Totally Unknown Company Inc")];
     // 1st Date.now() call = startedAt (0). 2nd call = the budget check before company
     // 0 (small elapsed, proceeds). 3rd call = the budget check before company 1
     // (elapsed now reads past the 25000ms budget, so the loop stops there).
     const output = await runStep(
-      { companies, partner: "Socure", startTime: "2026-08-28T10:00:00Z" },
+      { companiesJson: JSON.stringify(companies), partner: "Socure", startTime: "2026-08-28T10:00:00Z" },
       { dateNowSequence: [0, 1000, 30000] }
     );
 
@@ -162,6 +171,71 @@ async function main() {
     assert.strictEqual(output.results[2].companyName, "Totally Unknown Company Inc", "skipped entries keep their real company name, not silently dropped");
 
     console.log("PASS: time-budget-exceeded scenario stops cleanly and labels skipped companies correctly");
+  }
+
+  // Fallback path: inputData.companies as a genuine array, no companiesJson at all.
+  // Secondary/testability path only — not how the live Zap wiring works — but must
+  // still function so this file stays directly testable without JSON round-tripping.
+  {
+    const companies = [company("PayMeadow")];
+    const output = await runStep({ companies, partner: "Socure", startTime: "2026-08-28T10:00:00Z" });
+
+    assert.strictEqual(output.results.length, 1);
+    assert.strictEqual(output.results[0].status, "written");
+    assert.strictEqual(output.companiesMatched, 1);
+
+    console.log("PASS: fallback to inputData.companies (genuine array) works when companiesJson is absent");
+  }
+
+  // The exact real-world bug this change fixes: Zapier's "Step Output {...}" picker
+  // mapped to a downstream field inserts the WHOLE upstream step's output object,
+  // stringified — not just the nested companies array. Simulate that literally:
+  // companiesJson holds the entire Step 3 output object as a JSON string, not just
+  // the array. JSON.parse() succeeds, but the result isn't an array, so it must NOT
+  // be silently accepted — it should fall through to the (here, also missing)
+  // companies fallback and throw the clear, diagnosable error.
+  {
+    const wholeStepOutputMistakenlyMapped = JSON.stringify({
+      companies: [company("PayMeadow")],
+      companiesJson: JSON.stringify([company("PayMeadow")]),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z",
+      companyCount: 1
+    });
+
+    await assert.rejects(
+      () => runStep({ companiesJson: wholeStepOutputMistakenlyMapped, partner: "Socure", startTime: "2026-08-28T10:00:00Z" }),
+      (err) =>
+        err.message.includes("No companies array found") &&
+        err.message.includes("companiesJson") &&
+        err.message.includes("companies"),
+      "mapping the whole stringified Step 3 output into companiesJson should throw a clear, diagnosable error, not silently misbehave"
+    );
+
+    console.log("PASS: the whole-step-output-stringified-into-companiesJson mistake throws a clear error instead of silently misbehaving");
+  }
+
+  // Neither companiesJson nor companies present at all.
+  {
+    await assert.rejects(
+      () => runStep({ partner: "Socure", startTime: "2026-08-28T10:00:00Z" }),
+      (err) => err.message.includes("No companies array found") && err.message.includes("companiesJson") && err.message.includes("companies"),
+      "missing both fields should throw a clear error naming both fields checked"
+    );
+
+    console.log("PASS: missing companiesJson and companies throws a clear error naming both fields checked");
+  }
+
+  // companiesJson present but malformed JSON — should throw a clear parse error, not
+  // an opaque native SyntaxError with no context about which field caused it.
+  {
+    await assert.rejects(
+      () => runStep({ companiesJson: "{not valid json", partner: "Socure", startTime: "2026-08-28T10:00:00Z" }),
+      (err) => err.message.includes("companiesJson") && err.message.includes("could not be parsed"),
+      "malformed companiesJson should throw a clear parse error naming the field"
+    );
+
+    console.log("PASS: malformed companiesJson throws a clear, field-specific parse error");
   }
 
   console.log("\nAll tests passed.");

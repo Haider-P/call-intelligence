@@ -117,15 +117,32 @@ Inside this loop, in order:
 | B | **Filter by Zapier** | Only continue if Step A's value **does not exist** (i.e. this call hasn't been processed yet) |
 | C | **Code by Zapier** → Run Javascript | Paste `02-fetch-transcript.js`. inputData: `conversationId`, `partner`, `topic`, `startTime` (map from the loop item). Environment Variables: `APOLLO_API_KEY`. |
 | D | **Code by Zapier** → Run Javascript | Paste `03-claude-enrichment.js`. inputData: `transcriptText`, `partner`, `topic`, `startTime` (map from Step C). Environment Variables: `ANTHROPIC_API_KEY`. |
-| E | **Code by Zapier** → Run Javascript | Paste `04-match-and-write-companies.js`. inputData: `companies` (Step D's array output), `partner`, `startTime` (carry forward from the outer loop item — Zapier lets you reference fields from any earlier step in the same branch, not just the immediately preceding one). Environment Variables: `HUBSPOT_ACCESS_TOKEN`. |
+| E | **Code by Zapier** → Run Javascript | Paste `04-match-and-write-companies.js`. inputData: `companiesJson` (**map Step D's "Companies Json" output field specifically — a plain string pill — NOT "Step Output {...}"**; see the callout below), `partner`, `startTime` (carry forward from the outer loop item — Zapier lets you reference fields from any earlier step in the same branch, not just the immediately preceding one). Environment Variables: `HUBSPOT_ACCESS_TOKEN`. |
 | F | **Digest by Zapier** → Add to Digest | Digest name e.g. `call-intel-run-report` (same digest as the unlisted-partner branch). Fields: `partner`, `startTime`, `companiesProcessed`, `companiesMatched`, `companiesNoMatch`, `companiesSkippedTimeout`, `companiesErrored`, and `results` (Zapier will store the array as a single field — see note below if your digest needs it human-readable). |
 
 Step E does the job the old inner loop + Steps E/F used to do (deal matching + property
-write + note, per company) — but as one Code step that loops over `companies` in plain
-JavaScript instead of a second native Zapier loop. It returns one aggregated `results`
-array (plus summary counts) for the **whole call**, so Step F fires **once per call**,
-not once per company — that's what makes a single, non-nested outer loop enough to get
-every company's outcome into the digest.
+write + note, per company) — but as one Code step that loops over the companies array
+in plain JavaScript instead of a second native Zapier loop. It returns one aggregated
+`results` array (plus summary counts) for the **whole call**, so Step F fires **once
+per call**, not once per company — that's what makes a single, non-nested outer loop
+enough to get every company's outcome into the digest.
+
+**Field mapping gotcha: map `companiesJson`, not "Step Output {...}".** Zapier's
+"Step Output {...}" data-picker inserts a step's ENTIRE output as one stringified
+object when mapped into a downstream Input Data field — it does not let you pick out
+just one nested array field within that output. Confirmed live: mapping Step D's Step
+Output into Step E's `companies` field resulted in `inputData.companies` being the
+*whole* `{ companies, companiesJson, partner, startTime, companyCount }` object,
+stringified — not the companies array alone — and Step E failed with "No companies
+array in inputData". **The fix:** Step D outputs a dedicated field, `companiesJson`
+— a JSON string of *just* the companies array, nothing else — which shows up in
+Zapier's field picker as its own plain string pill ("Companies Json"), unambiguous to
+map. Map that specific field to Step E's `companiesJson` input, and Step E
+`JSON.parse()`s it explicitly (see `resolveCompanies()` in `04-match-and-write-
+companies.js`) rather than relying on Zapier's array-vs-object-vs-string field-picker
+behavior. If a future field mapping mistake reintroduces this (e.g. someone maps Step
+Output again out of habit), Step E's error message names both fields it checked
+(`companiesJson`, `companies`) so it's fast to diagnose rather than a silent failure.
 
 **Making `results` readable in the digest.** `results` is an array of objects
 (`{ companyName, status, dealId, noteId, updatedProperties, reason, ... }` — see Step
@@ -175,6 +192,9 @@ Digest by Zapier needs a separate scheduled release. Set this up as its own tiny
 - [ ] Run the full chain against one real partner-sync call — confirm the company count
       and quality roughly matches the validated Socure test (specific, not generic,
       per-company extraction)
+- [ ] Confirm Step D → Step E's `companiesJson` field is mapped from Step D's dedicated
+      "Companies Json" pill, not "Step Output {...}" — if it's wrong, Step E throws
+      `"No companies array found in inputData"` immediately (see Troubleshooting)
 - [ ] Confirm a company with no matching HubSpot deal produces a clean "no matching
       deal found" result in Step E's `results` array and makes zero HubSpot write calls
       for that company
@@ -203,5 +223,7 @@ Digest by Zapier needs a separate scheduled release. Set this up as its own tiny
 | A company's `results` entry says "no matching deal found" for a deal you know exists | Check the deal name is exactly `{Partner} - {Company}`. The matcher tolerates punctuation/case variance (e.g. "US Bank" vs "U.S. Bank") via `normalize()`, and known transcription mismatches (e.g. "PayMeadow" vs "Paymitto") via `COMPANY_NAME_ALIASES` — if it's a recurring real company hitting a transcription gap, add it to that map (see the living-list comment above it in `04-match-and-write-companies.js`) rather than widening the fuzzy-match tolerance. |
 | A company's `results` entry has `status: "skipped-timeout"` | The call's company count was too large to finish inside Zapier's 30s Code-step limit even with parallel matching + a soft budget. Check `companiesSkippedTimeout` in Step E's output — those companies were never attempted (not a false "no match"). No automatic retry exists yet; re-running the call (once the Storage dedup key is cleared) will reprocess all its companies from scratch, including ones already written on the prior partial run — check `results` from the prior run before manually re-triggering. |
 | A company's `results` entry has `status: "error"` | An unexpected HubSpot failure (network blip, transient 5xx) on that one company's search or write — check the entry's `reason` for the underlying error. Per-company try/catch means this does not abort the rest of the call's companies (see `companiesErrored` in Step E's header comment for why this exists in the merged single-step design). |
+| Step E throws `"No companies array found in inputData"` | You mapped Step D's "Step Output {...}" (or the `companies` field) into Step E's `companiesJson` input instead of Step D's dedicated **"Companies Json"** output field. Zapier's Step Output picker stringifies the whole upstream object, not just the nested array — re-map to the specific `companiesJson` field. See the "Field mapping gotcha" callout above. |
+| Step E throws `"inputData.companiesJson could not be parsed as JSON"` | `companiesJson` is present but isn't valid JSON — most likely something other than Step D's `companiesJson` output got mapped there (e.g. `topic` or `transcriptText`). Check the field mapping. |
 | Same call processed twice | Confirm Step G (Storage Set Value) is actually wired after Step E, and Step A/B (Storage Get + Filter) are wired before Step C in every run |
 | Someone added a second "Looping by Zapier" step and the Zap won't turn on | This is expected — Zapier enforces "no more than one Looping by Zapier step per Zap." Remove the second loop; the per-company fan-out belongs inside `04-match-and-write-companies.js`'s plain-JS `for...of` loop, not a second native loop. See "Why only one native loop" above. |
