@@ -25,7 +25,8 @@ const source = fs.readFileSync(SOURCE_PATH, "utf8");
 // normalize()-based fuzzy path (extracted as "US Bank", no alias needed).
 const HUBSPOT_DEALS = [
   { id: "d1", properties: { dealname: "Socure - Paymitto" } },
-  { id: "d2", properties: { dealname: "Socure - U.S. Bank" } }
+  { id: "d2", properties: { dealname: "Socure - U.S. Bank" } },
+  { id: "d3", properties: { dealname: "Socure - SentimentTestCo" } }
 ];
 
 // Loose substring match on alphanumeric-only text, standing in for HubSpot's real
@@ -87,12 +88,18 @@ function makeFakeSetTimeout(delayCalls, bumpWave) {
 async function runStep(inputDataFields, { dateNowSequence } = {}) {
   const delayCalls = [];
   const searchWaveLog = []; // { query, wave } — one entry per HubSpot search call
+  const patchLog = []; // { dealId, properties } — one entry per deal PATCH call
   let currentWave = 0;
 
-  function fetchWithWaveTracking(url, opts) {
+  function fetchWithTracking(url, opts) {
     if (url.includes("/deals/search") && opts.method === "POST") {
       const body = JSON.parse(opts.body);
       searchWaveLog.push({ query: body.query, wave: currentWave });
+    }
+    if (url.includes("/deals/") && !url.includes("/deals/search") && opts.method === "PATCH") {
+      const dealId = url.split("/deals/")[1];
+      const body = JSON.parse(opts.body);
+      patchLog.push({ dealId, properties: body.properties });
     }
     return mockFetch(url, opts);
   }
@@ -101,7 +108,7 @@ async function runStep(inputDataFields, { dateNowSequence } = {}) {
     process: { env: { HUBSPOT_ACCESS_TOKEN: "test-token" } },
     inputData: inputDataFields,
     console,
-    fetch: fetchWithWaveTracking,
+    fetch: fetchWithTracking,
     setTimeout: makeFakeSetTimeout(delayCalls, () => {
       currentWave++;
     }),
@@ -110,7 +117,7 @@ async function runStep(inputDataFields, { dateNowSequence } = {}) {
   vm.createContext(sandbox);
   const wrapped = `(async () => {\n${source}\n})()`;
   await vm.runInContext(wrapped, sandbox, { filename: SOURCE_PATH });
-  return { output: sandbox.output, delayCalls, searchWaveLog };
+  return { output: sandbox.output, delayCalls, searchWaveLog, patchLog };
 }
 
 function company(companyName, overrides = {}) {
@@ -269,6 +276,55 @@ async function main() {
     );
 
     console.log("PASS: malformed companiesJson throws a clear, field-specific parse error");
+  }
+
+  // Sentiment casing mapping (added 2026-08-28 after a live run got HubSpot 400
+  // INVALID_OPTION errors: last_call_sentiment's dropdown options are capitalized
+  // ("Positive"/"Neutral"/"At-Risk"), but the enrichment step's sentiment values are
+  // lowercase). All 3 known values must map correctly, and an unrecognized value must
+  // default to "Neutral" and be flagged in the result's `reason`, not fail the write.
+  {
+    const companies = [
+      company("SentimentTestCo", { sentiment: "positive" }),
+      company("SentimentTestCo", { sentiment: "neutral" }),
+      company("SentimentTestCo", { sentiment: "at-risk" }),
+      company("SentimentTestCo", { sentiment: "somethingUnexpected" })
+    ];
+    const { output, patchLog } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(output.companiesMatched, 4, "all 4 should still match and write successfully");
+    assert.strictEqual(patchLog.length, 4);
+
+    assert.strictEqual(patchLog[0].properties.last_call_sentiment, "Positive");
+    assert.strictEqual(patchLog[1].properties.last_call_sentiment, "Neutral");
+    assert.strictEqual(patchLog[2].properties.last_call_sentiment, "At-Risk");
+    assert.strictEqual(
+      patchLog[3].properties.last_call_sentiment,
+      "Neutral",
+      "an unrecognized sentiment value should default to Neutral rather than being sent as-is"
+    );
+
+    const [r1, r2, r3, r4] = output.results;
+    assert.strictEqual(r1.status, "written");
+    assert.strictEqual(r1.reason, null, "a known sentiment value should not flag a reason");
+    assert.strictEqual(r2.status, "written");
+    assert.strictEqual(r2.reason, null);
+    assert.strictEqual(r3.status, "written");
+    assert.strictEqual(r3.reason, null);
+
+    assert.strictEqual(r4.status, "written", "an unrecognized sentiment should still be a successful write, not an error");
+    assert.ok(
+      r4.reason &&
+        r4.reason.includes("somethingUnexpected") &&
+        r4.reason.includes("Neutral"),
+      "the fallback should be visibly flagged in the result's reason, naming both the bad value and what it defaulted to"
+    );
+
+    console.log("PASS: sentiment values map to HubSpot's capitalized dropdown options, with a visible fallback for unrecognized values");
   }
 
   // Batch throttling (added 2026-08-28 after a live dry run got 429'd firing all

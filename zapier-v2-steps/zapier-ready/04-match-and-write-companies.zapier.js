@@ -86,6 +86,16 @@
  * unexpected HubSpot failure can no longer silently abort every other company's
  * results the way a single uncaught throw would in this merged single-step design.
  *
+ * HUBSPOT DROPDOWN CASING — the last_call_sentiment property's dropdown options are
+ * capitalized ("Positive", "Neutral", "At-Risk"), but the enrichment step's sentiment
+ * values are lowercase — confirmed live: writing the lowercase value directly caused
+ * a HubSpot 400 INVALID_OPTION error on every write. mapSentimentToHubSpotOption()
+ * below converts it at write time; an unrecognized value defaults to "Neutral" rather
+ * than failing the write, and that fallback is surfaced as a non-null `reason` on an
+ * otherwise-successful "written" result entry (not folded into "error" — it's a
+ * data-quality note on a write that still succeeded). If a future HubSpot dropdown
+ * property gets added to this pipeline, check its exact option casing the same way.
+ *
  * See "Why only one native loop" in ../../docs/zapier-v2-setup.md for the full
  * architecture rationale — do not "fix" this by adding a second Looping by Zapier step;
  * that is the exact constraint this file works around.
@@ -192,6 +202,35 @@ async function matchCompanyDeal(token, partner, rawCompanyName) {
 
 // ---- Deal + note write (ported from 05-write-deal-and-note.js, unchanged) ---------
 
+// HubSpot's last_call_sentiment dropdown property options are capitalized
+// ("Positive", "Neutral", "At-Risk"), but the enrichment step's sentiment values
+// (company.sentiment, from 03-claude-enrichment.js) are lowercase ("positive",
+// "neutral", "at-risk") — confirmed live: writing the lowercase value directly to
+// this property caused a HubSpot 400 INVALID_OPTION error on every write. Deliberately
+// NOT fixed by changing the enrichment step's output format — lowercase is the more
+// natural JS/JSON convention and that value may be used elsewhere — the
+// HubSpot-specific casing requirement is kept isolated to this one write step, where
+// it belongs. If a future HubSpot dropdown property gets added to this pipeline,
+// check its exact option casing the same way rather than assuming any lowercase
+// value will be accepted as-is.
+const SENTIMENT_TO_HUBSPOT_OPTION = {
+  positive: "Positive",
+  neutral: "Neutral",
+  "at-risk": "At-Risk"
+};
+
+// Falls back to "Neutral" for anything unrecognized (unexpected casing, a typo from
+// a future prompt change, an entirely new sentiment value, etc.) rather than sending
+// an invalid option and failing the whole write. usedFallback is surfaced by the
+// caller into the company's `results` entry so a silent default doesn't go unnoticed.
+function mapSentimentToHubSpotOption(sentiment) {
+  const key = (sentiment || "").toLowerCase().trim();
+  if (Object.prototype.hasOwnProperty.call(SENTIMENT_TO_HUBSPOT_OPTION, key)) {
+    return { value: SENTIMENT_TO_HUBSPOT_OPTION[key], usedFallback: false };
+  }
+  return { value: "Neutral", usedFallback: true };
+}
+
 async function patchDeal(token, dealId, properties) {
   const response = await fetch(`https://api.hubapi.com/crm/v3/objects/deals/${dealId}`, {
     method: "PATCH",
@@ -250,9 +289,11 @@ async function writeCompanyUpdate(token, partner, startTime, matchResult, compan
   const callDate = startTime ? new Date(startTime) : new Date();
   const callDateStr = callDate.toISOString().split("T")[0];
 
+  const { value: hubspotSentiment, usedFallback: sentimentFallbackUsed } = mapSentimentToHubSpotOption(sentiment);
+
   const properties = {
     hs_next_step: nextStep,
-    last_call_sentiment: sentiment,
+    last_call_sentiment: hubspotSentiment,
     last_call_date: callDateStr,
     last_call_unresolved_objections:
       unresolvedObjections && unresolvedObjections !== "None" ? unresolvedObjections : ""
@@ -260,6 +301,8 @@ async function writeCompanyUpdate(token, partner, startTime, matchResult, compan
 
   await patchDeal(token, matchResult.dealId, properties);
 
+  // Note body keeps the original (lowercase) sentiment as free text — it's not a
+  // HubSpot dropdown field, so the casing mapping above doesn't apply here.
   const noteBody = `📞 ${partner} / Markaaz Partnership sync — ${callDate.toLocaleDateString("en-US", {
     year: "numeric",
     month: "long",
@@ -275,7 +318,7 @@ ${rawSummary}`;
 
   const noteId = await createNote(token, matchResult.dealId, noteBody, callDate.getTime());
 
-  return { updatedProperties: Object.keys(properties), noteId };
+  return { updatedProperties: Object.keys(properties), noteId, sentimentFallbackUsed };
 }
 
 // ---- Reading the companies array (Zapier field-mapping gotcha) -------------------
@@ -465,7 +508,13 @@ for (let i = 0; i < companies.length; i++) {
   }
 
   try {
-    const { updatedProperties, noteId } = await writeCompanyUpdate(token, partner, startTime, matchResult, company);
+    const { updatedProperties, noteId, sentimentFallbackUsed } = await writeCompanyUpdate(
+      token,
+      partner,
+      startTime,
+      matchResult,
+      company
+    );
     results.push({
       companyName: matchResult.companyName,
       status: "written",
@@ -474,7 +523,11 @@ for (let i = 0; i < companies.length; i++) {
       updatedProperties,
       noteId,
       candidateCount: matchResult.candidateCount,
-      reason: null
+      // Still a successful write — reason is only non-null here to flag a data-quality
+      // note (an unrecognized sentiment value defaulted to "Neutral"), not a failure.
+      reason: sentimentFallbackUsed
+        ? `sentiment value "${company.sentiment}" did not match a known HubSpot option — defaulted to "Neutral"`
+        : null
     });
   } catch (err) {
     results.push({

@@ -185,6 +185,23 @@ this exact change (see `zapier-v2-steps/tests/04-match-and-write-companies.test.
 — it still stops cleanly and labels every unattempted company correctly, it just may
 trigger at a somewhat lower company-count threshold than before.
 
+**HubSpot dropdown option casing (`last_call_sentiment`).** Live testing hit a
+different real error, unrelated to matching or rate-limiting: HubSpot 400
+`INVALID_OPTION` on every write. Cause: the `last_call_sentiment` property is a
+HubSpot dropdown whose options are capitalized — **`"Positive"`, `"Neutral"`,
+`"At-Risk"`** — but the enrichment step (Step D / `03-claude-enrichment.js`) outputs
+lowercase sentiment values (`"positive"`, `"neutral"`, `"at-risk"`), which is the more
+natural JS/JSON convention and is left as-is there deliberately (that value may be
+used elsewhere; it isn't HubSpot-specific). The casing conversion is applied only at
+write time, in Step E, via `mapSentimentToHubSpotOption()` — see the "HUBSPOT DROPDOWN
+CASING" section of that file's header comment. An unrecognized sentiment value (a typo
+from a future prompt change, unexpected casing, etc.) defaults to `"Neutral"` rather
+than failing the write, and that fallback shows up as a non-null `reason` on an
+otherwise-successful `"written"` result entry — worth scanning for occasionally even
+though it's not a failure. **If you add a new HubSpot dropdown property to this
+pipeline later, check its exact option casing against what gets written before
+shipping — this exact mismatch is easy to hit again with any new dropdown field.**
+
 **Making `results` readable in the digest.** `results` is an array of objects
 (`{ companyName, status, dealId, noteId, updatedProperties, reason, ... }` — see Step
 E's header comment for the full shape). Digest by Zapier fields generally expect
@@ -270,6 +287,7 @@ Digest by Zapier needs a separate scheduled release. Set this up as its own tiny
 | A company's `results` entry has `status: "skipped-timeout"` | The call's company count was too large to finish inside Zapier's 30s Code-step limit even with parallel matching + a soft budget. Check `companiesSkippedTimeout` in Step E's output — those companies were never attempted (not a false "no match"). No automatic retry exists yet; re-running the call (once the Storage dedup key is cleared) will reprocess all its companies from scratch, including ones already written on the prior partial run — check `results` from the prior run before manually re-triggering. |
 | A company's `results` entry has `status: "error"` | An unexpected HubSpot failure (network blip, transient 5xx) on that one company's search or write — check the entry's `reason` for the underlying error. Per-company try/catch means this does not abort the rest of the call's companies (see `companiesErrored` in Step E's header comment for why this exists in the merged single-step design). |
 | A company's `results` entry has `reason` containing `429` / mentions a rate limit | Deal-search throttling wasn't enough for this run's request pattern — check `SEARCH_BATCH_SIZE` / `SEARCH_BATCH_DELAY_MS` in `04-match-and-write-companies.js` are still what they should be (3 companies / 1000ms, ~3 req/s, under HubSpot's published 5 req/s CRM Search API limit — see "Why Phase 1 is throttled" above). If someone tightened the delay or widened the batch size to save time, that's the likely cause — revert, don't remove throttling entirely. |
+| HubSpot returns `400 INVALID_OPTION` on a deal write, or a `results` entry's `reason` mentions a sentiment value that "did not match a known HubSpot option" | `last_call_sentiment` needs a capitalized value (`Positive`/`Neutral`/`At-Risk`); `mapSentimentToHubSpotOption()` in `04-match-and-write-companies.js` should already be converting this at write time — see the "HubSpot dropdown option casing" note above. If the error is on a *different* HubSpot dropdown property, that property needs the same kind of casing check/mapping added — it's not automatic for new properties. |
 | Step E throws `"No companies array found in inputData"` | You mapped Step D's "Step Output {...}" (or the `companies` field) into Step E's `companiesJson` input instead of Step D's dedicated **"Companies Json"** output field. Zapier's Step Output picker stringifies the whole upstream object, not just the nested array — re-map to the specific `companiesJson` field. See the "Field mapping gotcha" callout above. |
 | Step E throws `"inputData.companiesJson could not be parsed as JSON"` | `companiesJson` is present but isn't valid JSON — most likely something other than Step D's `companiesJson` output got mapped there (e.g. `topic` or `transcriptText`). Check the field mapping. |
 | Same call processed twice | Confirm Step G (Storage Set Value) is actually wired after Step E, and Step A/B (Storage Get + Filter) are wired before Step C in every run |
