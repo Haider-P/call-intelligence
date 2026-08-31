@@ -135,11 +135,15 @@ function hasFuzzySyncKeyword(topicLower) {
   return false;
 }
 
-// How far back to search on each hourly poll. Deliberately wider than the 1-hour
-// trigger interval so a slow Apollo sync or a missed/late poll doesn't drop a call —
-// Storage by Zapier dedup (wired natively around the outer loop, see setup guide)
-// is what actually prevents reprocessing, not this window being narrow.
-const LOOKBACK_HOURS = 3;
+// How far back to search on each hourly poll. Set to 96h (4 days) specifically to
+// bridge the weekend gap: a Monday-morning run must still catch partner-sync calls
+// from Friday evening through Sunday, which a narrow window (e.g. 3h) would miss
+// entirely since nothing runs to "catch up" across the weekend. Safe to keep wide
+// because Storage by Zapier dedup (wired natively around the outer loop, see setup
+// guide) — not this window — is what prevents reprocessing of already-"processed"
+// calls; a wider window just means Step 2's Apollo search re-surfaces more already-
+// seen candidates per run, which costs 0 credits per Apollo's docs.
+const LOOKBACK_HOURS = 96;
 
 function matchPartnerFromTopic(topic) {
   const topicLower = (topic || "").toLowerCase();
