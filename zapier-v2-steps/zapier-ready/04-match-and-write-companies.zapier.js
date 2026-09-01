@@ -78,8 +78,9 @@
  *   inputData: companiesJson (string, from Step 3/enrichment's dedicated
  *     "Companies Json" output field — NOT Step Output {...}, see the field-mapping
  *     gotcha above), partner, startTime, hubspotAccessToken
- *   output: { results: [...], companiesProcessed, companiesMatched, companiesNoMatch,
- *             companiesSkippedTimeout, companiesErrored, partner, startTime }
+ *   output: { results: [...], companiesProcessed, companiesMatched, companiesCreated,
+ *             companiesNoMatch, companiesSkippedTimeout, companiesErrored, partner,
+ *             startTime }
  *
  * companiesErrored is one field beyond the originally-specified output shape: a
  * per-company try/catch around both the match and write calls means one company's
@@ -95,6 +96,16 @@
  * otherwise-successful "written" result entry (not folded into "error" — it's a
  * data-quality note on a write that still succeeded). If a future HubSpot dropdown
  * property gets added to this pipeline, check its exact option casing the same way.
+ *
+ * DEAL AUTO-CREATION (added 2026-09-01) — when Phase 1 finds no existing deal for a
+ * company, this step now CREATES one instead of just reporting "no-match" (see the
+ * "Deal auto-creation" section below for the full mechanics: pipeline/stage
+ * resolution, associations, and several corrections to the originally-assumed HubSpot
+ * schema — confirmed live against this portal, not guessed). A newly created deal
+ * gets a status of "created" in `results`, distinct from "written" (an existing deal
+ * that got matched and updated) — both are success outcomes, just for different
+ * starting states. This adds real write-call volume on top of the existing ~25s
+ * SOFT_TIME_BUDGET_MS (unchanged) — see the note near that constant below.
  *
  * See "Why only one native loop" in ../../docs/zapier-v2-setup.md for the full
  * architecture rationale — do not "fix" this by adding a second Looping by Zapier step;
@@ -354,6 +365,292 @@ ${rawSummary}`;
   return { updatedProperties: Object.keys(properties), noteId, sentimentFallbackUsed };
 }
 
+// ---- Deal auto-creation for unmatched companies (added 2026-09-01) ---------------
+//
+// Several details below were originally assumed (a "{Partner} Program" deal-naming
+// convention, a "Channel Partner Pipeline" label, a "child_deal" property accepting
+// "Yes") and turned out not to match this portal's real schema — confirmed live via
+// GET calls against the actual portal on 2026-09-01, documented at each correction
+// below rather than silently "fixed." See the session report for the full evidence
+// trail; the summary is captured in the comments on the constants themselves.
+
+// Pipeline labels, resolved dynamically (not hardcoded IDs — see resolvePipelines()
+// below) since pipeline IDs are portal-specific and this keeps the step portable if
+// it's ever pointed at a different portal/sandbox. CORRECTION: the Channel Partners
+// pipeline's real label is "Channel Partners", not "Channel Partner Pipeline".
+const PARTNER_DEAL_LIFECYCLE_PIPELINE_LABEL = "Partner Deal Lifecycle";
+const CHANNEL_PARTNER_PIPELINE_LABEL = "Channel Partners";
+
+// Starting stage for every auto-created deal. Confirmed live 2026-09-01: the Partner
+// Deal Lifecycle pipeline's first (displayOrder 0) stage is literally named "Partner
+// Lead Registration" (metadata: isClosed false, probability 0.05) — the clearest
+// available match for "deal registered" semantics, not an arbitrary first stage
+// picked by position. Matched by exact label (see resolvePipelines()), not
+// displayOrder, so a future stage reorder can't silently misfile new deals into the
+// wrong stage — if this label is ever renamed, resolution fails loudly instead of
+// guessing a different stage.
+const PARTNER_DEAL_LIFECYCLE_START_STAGE_LABEL = "Partner Lead Registration";
+
+// CORRECTION: GET /crm/v3/properties/deals/child_deal returned 404 — that exact
+// property name doesn't exist in this portal. The real property is `child_deals`
+// (plural), type enumeration / fieldType booleancheckbox, with options
+// {value: "true", label: "Yes"} / {value: "false", label: "No"} — the value actually
+// stored is the literal string "true", "Yes" is only the checkbox's display label.
+// Hardcoded + documented here rather than looked up live every run, same pattern this
+// file already uses for last_call_sentiment's dropdown casing (see
+// SENTIMENT_TO_HUBSPOT_OPTION above) — property internal names and enum values are
+// stable schema metadata, not something that changes portal-to-portal or run-to-run.
+const CHILD_DEALS_PROPERTY_NAME = "child_deals";
+const CHILD_DEALS_TRUE_VALUE = "true";
+
+// Deal<->company association labels. Confirmed live 2026-09-01 via GET
+// /crm/v4/associations/deals/companies/labels: "Partner" = USER_DEFINED typeId 88,
+// "End User" = USER_DEFINED typeId 90 (HubSpot's real label is "End User", not "End
+// user"). Hardcoded + documented, same convention as the note-to-deal association
+// (HUBSPOT_DEFINED typeId 214) already used in createNote() above — this file's
+// established pattern is "confirm once via the labels endpoint, hardcode with a
+// comment," not a live lookup on every run.
+const PARTNER_COMPANY_ASSOCIATION_TYPE_ID = 88;
+const END_USER_COMPANY_ASSOCIATION_TYPE_ID = 90;
+
+// Deal<->deal "Parent Deal" association label. Confirmed live 2026-09-01 via GET
+// /crm/v4/associations/deals/deals/labels: "Parent Deal" = USER_DEFINED typeId 84.
+// Its reciprocal, "Child Deal" (typeId 85), auto-applies on the other side — no
+// second call needed, confirmed against this portal's existing Parent Deal/Child
+// Deal pairs.
+const PARENT_DEAL_ASSOCIATION_TYPE_ID = 84;
+
+// Each of the 5 KNOWN_PARTNERS' own HubSpot Company record ID (see KNOWN_PARTNERS in
+// 01-filter-partner-calls.js). Confirmed live 2026-09-01 via company search — each
+// partner has exactly one company record with this exact name, no ambiguity found.
+// Hardcoded rather than searched per-run: (a) it's a small, fixed, well-known set,
+// nowhere near the scale that justifies a live search, and (b) a live search would
+// add Search API load to the same rate-limit budget Phase 1's deal-matching batches
+// already have to stay under (see SEARCH_BATCH_SIZE below). LIVING LIST — same
+// maintenance pattern as COMPANY_NAME_ALIASES above: if a new partner is ever added
+// to KNOWN_PARTNERS, its company ID must be looked up and added here before this file
+// can auto-create deals for that partner — see resolvePartnerContext() below for what
+// happens if it's missing (falls back to the old "no-match" behavior, does not crash
+// the run).
+const PARTNER_COMPANY_IDS = {
+  Socure: "16736354190",
+  Zenoo: "46903583569",
+  ZoomInfo: "18325500821",
+  Signicat: "19395102132",
+  Oscilar: "21867603006"
+};
+
+// Each of the 5 KNOWN_PARTNERS' top-level partnership deal in the Channel Partners
+// pipeline — the "Parent Deal" every new {Partner} - {Company} deal gets linked to.
+//
+// CORRECTION — no partner's real deal is actually named "{Partner} Program".
+// Confirmed live 2026-09-01: real names vary per partner with no consistent formula
+// ("Socure - Channel Partnership", "Signicat - Partnership Deal", "Oscilar - reseller
+// partnership", "ZoomInfo - Strategic Partnership", "Zenoo - Channel Partnership"),
+// and for ZoomInfo specifically the Channel Partners pipeline also holds several
+// OTHER ZoomInfo-named deals (Maintenance Fee FY26/FY27, Revenue Share FY26, Grade C
+// lead expansion x2, Global Expansion x2, ZI Studio Yr 2) that a name-based search
+// could not safely disambiguate from the real one — a per-run search, as originally
+// scoped, would either match nothing for most partners or risk linking new deals to
+// the wrong parent for ZoomInfo. That's a real data-integrity risk, not a style
+// preference, so this is hardcoded instead (same rationale as PARTNER_COMPANY_IDS).
+//
+// Each ID below was confirmed empirically, not guessed: every existing
+// {Partner} - {Company} deal already in the Partner Deal Lifecycle pipeline that
+// carries a "Parent Deal" (typeId 84) association already points at exactly one of
+// these IDs, per partner — i.e. this is the parent every human-created deal for that
+// partner is already actually using in production. Confirmed this way for Socure,
+// ZoomInfo, Signicat, and Oscilar. Zenoo's existing children (5 sampled) are NOT
+// currently linked via the "Parent Deal" label at all — only the plain default
+// association exists — so Zenoo's ID below (its one "Channel Partnership" deal,
+// matching the same naming pattern used for Socure) is inferred by naming-pattern
+// consistency, not confirmed via an existing "Parent Deal" link. Flagged to the
+// pipeline owner to sanity-check; new deals created by this step will use the proper
+// "Parent Deal" label for every partner going forward regardless.
+//
+// LIVING LIST — same maintenance pattern as PARTNER_COMPANY_IDS above: if a new
+// partner is added to KNOWN_PARTNERS, or a partner's canonical Program-equivalent
+// deal is ever replaced, this must be manually re-confirmed and updated — there is no
+// reliable automatic way to (re)discover it given the inconsistent naming.
+const PARTNER_PROGRAM_DEAL_IDS = {
+  Socure: "22010293408", // "Socure - Channel Partnership"
+  Zenoo: "51514482999", // "Zenoo - Channel Partnership" — inferred by naming pattern, not an existing Parent Deal link, see note above
+  ZoomInfo: "22678525001", // "ZoomInfo - Strategic Partnership"
+  Signicat: "21779255895", // "Signicat - Partnership Deal"
+  Oscilar: "21799341680" // "Oscilar - reseller partnership"
+};
+
+// Returns { partnerCompanyId, programDealId } for a configured partner, or null if
+// the partner isn't in both maps above — the caller falls back to the old "no-match"
+// behavior for an unconfigured partner rather than crashing the whole run or creating
+// a deal with a missing/guessed association.
+function resolvePartnerContext(partner) {
+  const partnerCompanyId = PARTNER_COMPANY_IDS[partner];
+  const programDealId = PARTNER_PROGRAM_DEAL_IDS[partner];
+  if (!partnerCompanyId || !programDealId) {
+    return null;
+  }
+  return { partnerCompanyId, programDealId };
+}
+
+// Fetches the portal's deal pipelines ONCE per run — called lazily, only the first
+// time Phase 2 actually needs it (i.e. only on a call with at least one unmatched,
+// auto-creatable company), not unconditionally on every run and not per-company. This
+// is a plain GET, not a CRM Search API call, so it doesn't touch the 5 req/s search
+// rate limit Phase 1's batches already have to stay under (see SEARCH_BATCH_SIZE
+// below) — but it's still kept to once per run rather than once per company, both to
+// minimize load and because pipeline/stage IDs don't vary per company within a run.
+//
+// Resolves both pipelines this step needs by exact label match and throws a clear,
+// named error if either the pipeline or the expected starting stage isn't found —
+// rather than silently falling back to a guess (e.g. the first stage by display
+// order). Placing a new deal in the wrong stage or pipeline is a real data-integrity
+// mistake, not a cosmetic one, so this fails loud instead of guessing.
+async function resolvePipelines(token) {
+  const response = await fetch("https://api.hubapi.com/crm/v3/pipelines/deals", {
+    headers: { Authorization: `Bearer ${token}` }
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to fetch deal pipelines: ${response.status} — ${errorText}`);
+  }
+
+  const data = await response.json();
+  const pipelines = data.results || [];
+
+  const lifecyclePipeline = pipelines.find((p) => p.label === PARTNER_DEAL_LIFECYCLE_PIPELINE_LABEL);
+  if (!lifecyclePipeline) {
+    throw new Error(
+      `Could not find a deal pipeline labeled "${PARTNER_DEAL_LIFECYCLE_PIPELINE_LABEL}" — check the pipeline still exists with this exact label`
+    );
+  }
+  const startStage = (lifecyclePipeline.stages || []).find(
+    (s) => s.label === PARTNER_DEAL_LIFECYCLE_START_STAGE_LABEL
+  );
+  if (!startStage) {
+    throw new Error(
+      `Could not find a stage labeled "${PARTNER_DEAL_LIFECYCLE_START_STAGE_LABEL}" in the "${PARTNER_DEAL_LIFECYCLE_PIPELINE_LABEL}" pipeline — check the stage still exists with this exact label`
+    );
+  }
+
+  const channelPartnerPipeline = pipelines.find((p) => p.label === CHANNEL_PARTNER_PIPELINE_LABEL);
+  if (!channelPartnerPipeline) {
+    throw new Error(
+      `Could not find a deal pipeline labeled "${CHANNEL_PARTNER_PIPELINE_LABEL}" — check the pipeline still exists with this exact label`
+    );
+  }
+
+  return {
+    lifecyclePipelineId: lifecyclePipeline.id,
+    startStageId: startStage.id,
+    channelPartnerPipelineId: channelPartnerPipeline.id
+  };
+}
+
+// Only called from createPartnerDeal() below, i.e. only for a company that already
+// failed to match an existing deal in Phase 1 — never adds Search API load for
+// companies that already matched there. Runs sequentially within Phase 2 (already
+// single-company-at-a-time, see the Phase 2 comment above), so it doesn't need its
+// own throttling on top of that existing sequential safety.
+//
+// Exact-match only, same "don't guess" rule as matchCompanyDeal() above: if the
+// search returns zero or more than one company whose normalize()'d name matches, this
+// returns null rather than guessing — the deal still gets created (see
+// createPartnerDeal()), just without an "End User" company association, and that gap
+// is surfaced in the result's `reason` for a human to fix manually.
+async function resolveEndUserCompanyId(token, companyName) {
+  const response = await fetch("https://api.hubapi.com/crm/v3/objects/companies/search", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      query: companyName,
+      properties: ["name"],
+      limit: 10
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`HubSpot company search failed: ${response.status} — ${errorText}`);
+  }
+
+  const data = await response.json();
+  const candidates = data.results || [];
+  const targetNormalized = normalize(companyName);
+  const exactMatches = candidates.filter((c) => normalize(c.properties.name) === targetNormalized);
+
+  return exactMatches.length === 1 ? exactMatches[0].id : null;
+}
+
+// Creates the new {Partner} - {Company} deal in the Partner Deal Lifecycle pipeline's
+// starting stage, associating the Partner company + (if resolved) the End User
+// company + the partner's Program-equivalent deal all in ONE create call, via the
+// `associations` array on POST /crm/v3/objects/deals — not a separate v4 PUT
+// afterward. Deliberate: this repo has already been bitten once by the v4
+// PUT-replaces-not-merges gotcha (PUTting a partial label list onto an object that
+// already has other labels silently drops the ones you didn't include) — that risk is
+// specific to modifying an EXISTING object's associations. A brand-new deal has no
+// pre-existing associations to accidentally clobber, so setting them inline at
+// creation sidesteps that whole class of bug entirely, more simply than a v4 PUT
+// would.
+//
+// Only sets the properties explicitly in scope here (dealname, pipeline, dealstage,
+// child_deals) — the caller (see the main loop below) runs writeCompanyUpdate()
+// against the newly created deal right afterward, the exact same call used for an
+// existing matched deal, so a newly created deal ends up with the same
+// hs_next_step/last_call_sentiment/last_call_date/last_call_unresolved_objections +
+// summary note as one that already existed and got matched, not a bare shell.
+async function createPartnerDeal(token, { partner, companyName, pipelineId, stageId, partnerCompanyId, programDealId }) {
+  const dealname = `${partner} - ${companyName}`;
+  const endUserCompanyId = await resolveEndUserCompanyId(token, companyName);
+
+  const associations = [
+    {
+      to: { id: partnerCompanyId },
+      types: [{ associationCategory: "USER_DEFINED", associationTypeId: PARTNER_COMPANY_ASSOCIATION_TYPE_ID }]
+    },
+    {
+      to: { id: programDealId },
+      types: [{ associationCategory: "USER_DEFINED", associationTypeId: PARENT_DEAL_ASSOCIATION_TYPE_ID }]
+    }
+  ];
+  if (endUserCompanyId) {
+    associations.push({
+      to: { id: endUserCompanyId },
+      types: [{ associationCategory: "USER_DEFINED", associationTypeId: END_USER_COMPANY_ASSOCIATION_TYPE_ID }]
+    });
+  }
+
+  const response = await fetch("https://api.hubapi.com/crm/v3/objects/deals", {
+    method: "POST",
+    headers: {
+      Authorization: `Bearer ${token}`,
+      "Content-Type": "application/json"
+    },
+    body: JSON.stringify({
+      properties: {
+        dealname,
+        pipeline: pipelineId,
+        dealstage: stageId,
+        [CHILD_DEALS_PROPERTY_NAME]: CHILD_DEALS_TRUE_VALUE
+      },
+      associations
+    })
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Failed to create deal "${dealname}": ${response.status} — ${errorText}`);
+  }
+
+  const data = await response.json();
+  return { dealId: data.id, dealname, endUserCompanyResolved: Boolean(endUserCompanyId) };
+}
+
 // ---- Reading the companies array (Zapier field-mapping gotcha) -------------------
 
 // Zapier's "Step Output {...}" data-picker inserts an ENTIRE step's output as one
@@ -503,6 +800,11 @@ const matchResults = await matchCompaniesThrottled(token, partner, companies);
 const results = [];
 let timedOut = false;
 
+// Resolved lazily, at most once for the whole run — see resolvePipelines()'s comment
+// for why this isn't fetched unconditionally up front. Stays null for the entire run
+// on a call where every company matches an existing deal.
+let pipelineContext = null;
+
 for (let i = 0; i < companies.length; i++) {
   if (Date.now() - startedAt > SOFT_TIME_BUDGET_MS) {
     timedOut = true;
@@ -527,16 +829,99 @@ for (let i = 0; i < companies.length; i++) {
   }
 
   if (!matchResult.matched) {
-    results.push({
-      companyName: matchResult.companyName,
-      status: "no-match",
-      dealId: null,
-      matchedDealName: null,
-      updatedProperties: [],
-      noteId: null,
-      candidateCount: matchResult.candidateCount,
-      reason: matchResult.reason
-    });
+    // DEAL AUTO-CREATION (added 2026-09-01) — no existing deal found, so create one
+    // instead of just reporting "no-match", UNLESS this call's partner isn't
+    // configured in PARTNER_COMPANY_IDS/PARTNER_PROGRAM_DEAL_IDS above (a partner
+    // added to KNOWN_PARTNERS in 01-filter-partner-calls.js but not yet added to
+    // those living lists here) — that case still falls back to the original
+    // "no-match" behavior rather than creating a deal with a missing/guessed
+    // association. NOTE: this branch adds real write-call volume (a company search +
+    // a deal create, on top of the same property-write + note calls a matched deal
+    // already gets) on top of the existing ~25s SOFT_TIME_BUDGET_MS above (left
+    // unchanged) — expect companiesSkippedTimeout to show up more often after this
+    // ships, especially on high-company-count calls with several unmatched
+    // companies, for the same "correctness over speed" reason SEARCH_BATCH_SIZE /
+    // SEARCH_BATCH_DELAY_MS was accepted for Phase 1 (see that comment above).
+    const partnerContext = resolvePartnerContext(partner);
+
+    if (!partnerContext) {
+      results.push({
+        companyName: matchResult.companyName,
+        status: "no-match",
+        dealId: null,
+        matchedDealName: null,
+        updatedProperties: [],
+        noteId: null,
+        candidateCount: matchResult.candidateCount,
+        reason: `${matchResult.reason} — deal auto-creation skipped: "${partner}" is not yet configured in PARTNER_COMPANY_IDS/PARTNER_PROGRAM_DEAL_IDS`
+      });
+      continue;
+    }
+
+    try {
+      if (!pipelineContext) {
+        pipelineContext = await resolvePipelines(token);
+      }
+
+      const created = await createPartnerDeal(token, {
+        partner,
+        companyName: matchResult.companyName,
+        pipelineId: pipelineContext.lifecyclePipelineId,
+        stageId: pipelineContext.startStageId,
+        partnerCompanyId: partnerContext.partnerCompanyId,
+        programDealId: partnerContext.programDealId
+      });
+
+      // Run the SAME property-write + note logic a matched deal gets, against the
+      // deal we just created — see createPartnerDeal()'s comment for why.
+      const syntheticMatchResult = {
+        companyName: matchResult.companyName,
+        matched: true,
+        dealId: created.dealId,
+        matchedDealName: created.dealname,
+        candidateCount: 0,
+        reason: null
+      };
+      const { updatedProperties, noteId, sentimentFallbackUsed } = await writeCompanyUpdate(
+        token,
+        partner,
+        startTime,
+        syntheticMatchResult,
+        company
+      );
+
+      const notes = [];
+      if (!created.endUserCompanyResolved) {
+        notes.push(
+          `no matching Company record found for "${matchResult.companyName}" — End User association not added, link manually`
+        );
+      }
+      if (sentimentFallbackUsed) {
+        notes.push(`sentiment value "${company.sentiment}" did not match a known HubSpot option — defaulted to "Neutral"`);
+      }
+
+      results.push({
+        companyName: matchResult.companyName,
+        status: "created",
+        dealId: created.dealId,
+        matchedDealName: created.dealname,
+        updatedProperties,
+        noteId,
+        candidateCount: matchResult.candidateCount,
+        reason: notes.length > 0 ? notes.join("; ") : null
+      });
+    } catch (err) {
+      results.push({
+        companyName: matchResult.companyName,
+        status: "error",
+        dealId: null,
+        matchedDealName: null,
+        updatedProperties: [],
+        noteId: null,
+        candidateCount: matchResult.candidateCount,
+        reason: `deal creation failed: ${err.message}`
+      });
+    }
     continue;
   }
 
@@ -596,18 +981,20 @@ if (timedOut) {
 }
 
 const companiesMatched = results.filter((r) => r.status === "written").length;
+const companiesCreated = results.filter((r) => r.status === "created").length;
 const companiesNoMatch = results.filter((r) => r.status === "no-match").length;
 const companiesSkippedTimeout = results.filter((r) => r.status === "skipped-timeout").length;
 const companiesErrored = results.filter((r) => r.status === "error").length;
 // "Processed" = actually attempted (regardless of outcome) — excludes companies never
 // reached due to the time budget. companiesProcessed + companiesSkippedTimeout should
 // always equal companies.length.
-const companiesProcessed = companiesMatched + companiesNoMatch + companiesErrored;
+const companiesProcessed = companiesMatched + companiesCreated + companiesNoMatch + companiesErrored;
 
 return {
   results,
   companiesProcessed,
   companiesMatched,
+  companiesCreated,
   companiesNoMatch,
   companiesSkippedTimeout,
   companiesErrored,

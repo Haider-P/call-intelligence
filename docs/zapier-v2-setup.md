@@ -197,7 +197,7 @@ letters map onto the full numbered step list):
 | C | **Code by Zapier** → Run Javascript | Paste `02-fetch-transcript.js`. inputData: `conversationId`, `partner`, `topic`, `startTime` (map from the loop item). Environment Variables: `APOLLO_API_KEY`. |
 | D | **Code by Zapier** → Run Javascript | Paste `03-claude-enrichment.js`. inputData: `transcriptText`, `partner`, `topic`, `startTime` (map from Step C). Environment Variables: `ANTHROPIC_API_KEY`. |
 | E | **Code by Zapier** → Run Javascript | Paste `04-match-and-write-companies.js`. inputData: `companiesJson` (**map Step D's "Companies Json" output field specifically — a plain string pill — NOT "Step Output {...}"**; see the callout below), `partner`, `startTime` (carry forward from the outer loop item — Zapier lets you reference fields from any earlier step in the same branch, not just the immediately preceding one). Environment Variables: `HUBSPOT_ACCESS_TOKEN`. |
-| F | **Digest by Zapier** → Add to Digest | Digest name e.g. `call-intel-run-report` (same digest as the unlisted-partner branch). Fields: `partner`, `startTime`, `companiesProcessed`, `companiesMatched`, `companiesNoMatch`, `companiesSkippedTimeout`, `companiesErrored`, and `results` (Zapier will store the array as a single field — see note below if your digest needs it human-readable). |
+| F | **Digest by Zapier** → Add to Digest | Digest name e.g. `call-intel-run-report` (same digest as the unlisted-partner branch). Fields: `partner`, `startTime`, `companiesProcessed`, `companiesMatched`, `companiesCreated`, `companiesNoMatch`, `companiesSkippedTimeout`, `companiesErrored`, and `results` (Zapier will store the array as a single field — see note below if your digest needs it human-readable). |
 
 Step E does the job the old inner loop + Steps E/F used to do (deal matching + property
 write + note, per company) — but as one Code step that loops over the companies array
@@ -329,6 +329,86 @@ though it's not a failure. **If you add a new HubSpot dropdown property to this
 pipeline later, check its exact option casing against what gets written before
 shipping — this exact mismatch is easy to hit again with any new dropdown field.**
 
+**Deal auto-creation for unmatched companies (added 2026-09-01).** When Phase 1 finds
+no existing `{Partner} - {Company}` deal for a company, Step E now **creates one**
+instead of just reporting `"no-match"` — unless the call's partner isn't yet
+configured for auto-creation (see the fallback note below), in which case the
+original `"no-match"` behavior still applies. A newly created deal gets result status
+`"created"`, distinct from `"written"` (an existing deal that got matched and
+updated) — both are success outcomes, just starting from a different state.
+
+The new deal is created in the **Partner Deal Lifecycle** pipeline's starting stage
+(`"Partner Lead Registration"` — the pipeline's first stage by display order, and the
+one whose label most directly matches "deal registered" semantics; see
+`resolvePipelines()`'s header comment in `04-match-and-write-companies.js` for the
+full reasoning), with `child_deals` (see correction below) set to `"true"`, then
+associated to: the Partner's own HubSpot Company record (label "Partner"), the
+end-user Company record if one can be found by exact name match (label "End User" —
+skipped, not guessed, if the search returns zero or more than one candidate; flagged
+in the result's `reason` when skipped), and the partner's top-level partnership deal
+in the Channel Partners pipeline (label "Parent Deal"). The same
+`hs_next_step`/`last_call_sentiment`/`last_call_date`/`last_call_unresolved_objections`
+property write + summary note that a matched deal gets is then applied to the new
+deal too, so it doesn't end up a bare shell.
+
+**Three corrections against the originally-assumed HubSpot schema, confirmed live
+2026-09-01 rather than guessed:**
+
+1. **No partner's real deal is actually named `"{Partner} Program"`.** Real names vary
+   per partner with no consistent formula: `"Socure - Channel Partnership"`,
+   `"Signicat - Partnership Deal"`, `"Oscilar - reseller partnership"`, `"ZoomInfo -
+   Strategic Partnership"`, `"Zenoo - Channel Partnership"`. For ZoomInfo specifically,
+   the Channel Partners pipeline also holds several other ZoomInfo-named deals
+   (Maintenance Fee FY26/FY27, Revenue Share FY26, two "Grade C lead expansion"
+   variants, two "Global Expansion" variants, "ZI Studio Yr 2") that a name-based
+   search could not safely disambiguate from the real one — a live per-run search, as
+   originally scoped, would either match nothing for most partners or risk linking new
+   deals to the wrong parent for ZoomInfo. That's a real data-integrity risk, not a
+   style preference. **`PARTNER_PROGRAM_DEAL_IDS`** in `04-match-and-write-companies.js`
+   is hardcoded instead — each ID confirmed empirically: every existing
+   `{Partner} - {Company}` deal already in the Partner Deal Lifecycle pipeline that
+   carries a "Parent Deal" association already points at exactly one of these IDs, per
+   partner (confirmed this way for Socure, ZoomInfo, Signicat, Oscilar). **Zenoo is the
+   one exception** — its 5 sampled existing children are not currently linked via the
+   "Parent Deal" label at all (only the plain default association exists), so Zenoo's
+   ID is inferred by naming-pattern consistency with Socure's, not confirmed via an
+   existing link — flagged for the pipeline owner to sanity-check. New deals created by
+   this step use the proper "Parent Deal" label for every partner going forward
+   regardless. **Living list** — same maintenance pattern as `COMPANY_NAME_ALIASES`: a
+   new `KNOWN_PARTNERS` entry, or a replaced Program-equivalent deal, must be manually
+   re-confirmed and added here.
+2. **The Channel Partners pipeline's real label is `"Channel Partners"`, not "Channel
+   Partner Pipeline."** Both pipeline IDs (Partner Deal Lifecycle and Channel
+   Partners) are resolved dynamically via `GET /crm/v3/pipelines/deals` once per run
+   (see `resolvePipelines()`), matched by exact label — not hardcoded IDs, since
+   pipeline IDs are portal-specific.
+3. **`GET /crm/v3/properties/deals/child_deal` returns 404** — that exact property
+   name doesn't exist in this portal. The real property is **`child_deals`** (plural),
+   type enumeration / fieldType booleancheckbox, and its accepted values are the
+   literal strings `"true"` / `"false"` (displayed in HubSpot's UI as "Yes"/"No" — that
+   display label is not the stored value). `CHILD_DEALS_PROPERTY_NAME` /
+   `CHILD_DEALS_TRUE_VALUE` in the source file are hardcoded + documented, the same
+   convention this file already uses for `last_call_sentiment`'s dropdown casing (see
+   "HubSpot dropdown option casing" above) — confirmed once, not re-checked live every
+   run, since property internal names/enum values are stable schema metadata.
+
+**Unconfigured-partner fallback.** `PARTNER_COMPANY_IDS` and `PARTNER_PROGRAM_DEAL_IDS`
+in `04-match-and-write-companies.js` are living lists covering the 5 current
+`KNOWN_PARTNERS`. If a company's partner isn't in both maps (e.g. a partner just added
+to `KNOWN_PARTNERS` in `01-filter-partner-calls.js` but not yet confirmed and added
+here), deal auto-creation is skipped for that company and it falls back to the
+original `"no-match"` result — the `reason` names the unconfigured partner explicitly.
+This never creates a deal with a missing or guessed association.
+
+**Rate-limit / timeout impact.** Creating a deal adds real write-call volume beyond
+what a matched deal already needed: one Company search (to resolve the End User
+association) plus the deal-create call itself, before the same property-write + note
+calls a matched deal gets. `SOFT_TIME_BUDGET_MS` (~25s) is **unchanged** — this is the
+same "correctness over speed" trade-off already accepted for
+`SEARCH_BATCH_SIZE`/`SEARCH_BATCH_DELAY_MS` (see "Why Phase 1 is throttled" above).
+**Expect `companiesSkippedTimeout` to show up more often after this ships**,
+especially on high-company-count calls with several unmatched companies.
+
 **Making `results` readable in the digest.** `results` is an array of objects
 (`{ companyName, status, dealId, noteId, updatedProperties, reason, ... }` — see Step
 E's header comment for the full shape). Digest by Zapier fields generally expect
@@ -363,6 +443,34 @@ Digest by Zapier needs a separate scheduled release. Set this up as its own tiny
 |---|---|---|
 | 1 | **Digest by Zapier** | Trigger: Digest Ready — digest name `call-intel-run-report`, schedule hourly (or daily, your call) |
 | 2 | **Email by Zapier** or **Slack** | Send the digest's combined content — calls found, companies extracted, deals matched/written, no-match cases, and unlisted-partner flags all in one message |
+
+---
+
+## Native HubSpot workflow — deal-desk notification on new partner deals (added 2026-09-01)
+
+**Built and maintained directly in HubSpot's own workflow builder — not part of this
+Zap, and has no code artifact in this repo.** Complements the deal auto-creation
+described above ("Deal auto-creation for unmatched companies," in "The one outer
+loop — one iteration per matching call" above): every deal that Step E auto-creates
+lands in the **Partner Deal Lifecycle pipeline** (same pipeline both pieces depend
+on), and this workflow's trigger fires on exactly that event.
+
+| | |
+|---|---|
+| **Where it lives** | HubSpot → Automation → Workflows (portal-native, not Zapier) |
+| **Trigger** | Deal created, pipeline = Partner Deal Lifecycle |
+| **Action** | Send Email to `dealdesk@markaaz.com` |
+| **Email contents** | Deal name, partner, company name, and a link to the deal |
+
+Since this workflow fires on *any* new deal in that pipeline (not specifically ones
+Step E created), it will also notify on deals created by other means — that's expected
+and not scoped to this Zap's auto-creation feature specifically. There is nothing to
+maintain here from this repo's side; changes to the trigger, recipient, or email
+content are made directly in HubSpot's workflow builder by whoever owns that portal
+config. If the Partner Deal Lifecycle pipeline is ever renamed or replaced, both this
+workflow's trigger AND `PARTNER_DEAL_LIFECYCLE_PIPELINE_LABEL` in
+`04-match-and-write-companies.js` need updating together, or new auto-created deals
+and their deal-desk notification will drift out of sync silently.
 
 ---
 

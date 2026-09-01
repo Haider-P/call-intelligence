@@ -50,7 +50,32 @@ function mockSearchKey(s) {
   return s.toLowerCase();
 }
 
+// Real pipeline/stage data as confirmed live 2026-09-01 (see PARTNER_DEAL_LIFECYCLE_*
+// and CHANNEL_PARTNER_PIPELINE_LABEL constants in the source file) — used so these
+// tests exercise resolvePipelines()'s real label-matching logic, not a fake shape.
+const HUBSPOT_PIPELINES = [
+  {
+    id: "t_e4c9b7838c44cc90860044f6edcb2934",
+    label: "Partner Deal Lifecycle",
+    stages: [
+      { id: "1181884181", label: "Partner Lead Registration", displayOrder: 0 },
+      { id: "1181884182", label: "Prospecting", displayOrder: 1 }
+    ]
+  },
+  {
+    id: "68825648",
+    label: "Channel Partners",
+    stages: [{ id: "133660675", label: "Prospecting", displayOrder: 1 }]
+  }
+];
+
+// Companies that already exist as HubSpot Company records for the "no matching deal,
+// but the company itself exists" path — exact-name match only, same "don't guess"
+// rule as deal matching (see resolveEndUserCompanyId() in the source file).
+const HUBSPOT_COMPANIES = [{ id: "co-1", properties: { name: "Fluz" } }];
+
 let noteCounter = 0;
+let dealIdCounter = 0;
 
 function mockFetch(url, opts) {
   if (url.includes("/deals/search") && opts.method === "POST") {
@@ -59,6 +84,14 @@ function mockFetch(url, opts) {
     const results = HUBSPOT_DEALS.filter((d) => mockSearchKey(d.properties.dealname).includes(q));
     return Promise.resolve({ ok: true, json: async () => ({ results }) });
   }
+  if (url === "https://api.hubapi.com/crm/v3/objects/deals" && opts.method === "POST") {
+    dealIdCounter++;
+    const body = JSON.parse(opts.body);
+    return Promise.resolve({
+      ok: true,
+      json: async () => ({ id: `new-deal-${dealIdCounter}`, properties: body.properties })
+    });
+  }
   if (url.includes("/deals/") && opts.method === "PATCH") {
     return Promise.resolve({ ok: true, json: async () => ({}) });
   }
@@ -66,7 +99,16 @@ function mockFetch(url, opts) {
     noteCounter++;
     return Promise.resolve({ ok: true, json: async () => ({ id: `note-${noteCounter}` }) });
   }
-  return Promise.reject(new Error(`Unexpected fetch call in test mock: ${opts.method} ${url}`));
+  if (url === "https://api.hubapi.com/crm/v3/pipelines/deals" && (!opts || !opts.method)) {
+    return Promise.resolve({ ok: true, json: async () => ({ results: HUBSPOT_PIPELINES }) });
+  }
+  if (url === "https://api.hubapi.com/crm/v3/objects/companies/search" && opts.method === "POST") {
+    const body = JSON.parse(opts.body);
+    const q = mockSearchKey(body.query);
+    const results = HUBSPOT_COMPANIES.filter((c) => mockSearchKey(c.properties.name).includes(q));
+    return Promise.resolve({ ok: true, json: async () => ({ results }) });
+  }
+  return Promise.reject(new Error(`Unexpected fetch call in test mock: ${opts && opts.method} ${url}`));
 }
 
 // A Date subclass whose static now() returns a pre-scripted sequence instead of the
@@ -100,15 +142,21 @@ function makeFakeSetTimeout(delayCalls, bumpWave) {
 }
 
 async function runStep(inputDataFields, { dateNowSequence } = {}) {
+  dealIdCounter = 0; // reset so dealId assertions are deterministic within a single test block
   const delayCalls = [];
   const searchWaveLog = []; // { query, wave } — one entry per HubSpot search call
   const patchLog = []; // { dealId, properties } — one entry per deal PATCH call
+  const createLog = []; // { properties, associations } — one entry per deal CREATE call
   let currentWave = 0;
 
   function fetchWithTracking(url, opts) {
     if (url.includes("/deals/search") && opts.method === "POST") {
       const body = JSON.parse(opts.body);
       searchWaveLog.push({ query: body.query, wave: currentWave });
+    }
+    if (url === "https://api.hubapi.com/crm/v3/objects/deals" && opts.method === "POST") {
+      const body = JSON.parse(opts.body);
+      createLog.push({ properties: body.properties, associations: body.associations });
     }
     if (url.includes("/deals/") && !url.includes("/deals/search") && opts.method === "PATCH") {
       const dealId = url.split("/deals/")[1];
@@ -131,7 +179,7 @@ async function runStep(inputDataFields, { dateNowSequence } = {}) {
   vm.createContext(sandbox);
   const wrapped = `(async () => {\n${source}\n})()`;
   await vm.runInContext(wrapped, sandbox, { filename: SOURCE_PATH });
-  return { output: sandbox.output, delayCalls, searchWaveLog, patchLog };
+  return { output: sandbox.output, delayCalls, searchWaveLog, patchLog, createLog };
 }
 
 function company(companyName, overrides = {}) {
@@ -155,7 +203,7 @@ async function main() {
     const companies = [
       company("PayMeadow"), // alias -> Paymitto
       company("U.S. Bank"), // fuzzy (normalize()) -> real deal "US Bank" (no periods)
-      company("Totally Unknown Company Inc") // no match
+      company("Totally Unknown Company Inc") // no existing deal -> auto-created (2026-09-01), see below
     ];
     const { output, delayCalls } = await runStep({
       companiesJson: JSON.stringify(companies),
@@ -166,7 +214,8 @@ async function main() {
     assert.strictEqual(output.results.length, 3);
     assert.strictEqual(output.companiesProcessed, 3);
     assert.strictEqual(output.companiesMatched, 2, "PayMeadow and U.S. Bank should both match");
-    assert.strictEqual(output.companiesNoMatch, 1);
+    assert.strictEqual(output.companiesCreated, 1, "Totally Unknown Company Inc has no existing deal, so a new one is auto-created");
+    assert.strictEqual(output.companiesNoMatch, 0, "Socure is a configured partner, so no-match no longer terminates here — see the dedicated deal-auto-creation tests below");
     assert.strictEqual(output.companiesSkippedTimeout, 0);
     assert.strictEqual(output.companiesErrored, 0);
     assert.strictEqual(delayCalls.length, 0, "3 companies fit in a single batch (SEARCH_BATCH_SIZE=3) — no throttling delay needed");
@@ -188,14 +237,15 @@ async function main() {
     assert.strictEqual(r2.status, "written");
     assert.strictEqual(r2.dealId, "d2");
 
-    assert.strictEqual(r3.status, "no-match");
-    assert.strictEqual(r3.dealId, null);
+    assert.strictEqual(r3.status, "created", "distinct from 'written' — this is a brand-new deal, not an existing one that got matched");
+    assert.strictEqual(r3.dealId, "new-deal-1");
+    assert.ok(r3.noteId, "the newly created deal should also get a summary note, same as a matched deal");
     assert.ok(
-      r3.reason.includes("possible transcription mismatch") && r3.reason.includes("COMPANY_NAME_ALIASES"),
-      "no-match reason should flag possible transcription mismatch"
+      r3.reason.includes("no matching Company record found"),
+      "no Company record exists for 'Totally Unknown Company Inc' in the mock roster, so the End User association gap should be flagged"
     );
 
-    console.log("PASS: multiple companies (alias match + fuzzy match + no-match) processed correctly via companiesJson (primary path)");
+    console.log("PASS: multiple companies (alias match + fuzzy match + auto-created) processed correctly via companiesJson (primary path)");
   }
 
   // Time-budget-exceeded: force the soft-budget check to trip after the first
@@ -473,9 +523,15 @@ async function main() {
 
     // All 7 are unknown companies (not in HUBSPOT_DEALS) -- correctness of matching
     // isn't the point here, batching timing is; still confirm nothing was dropped.
+    // Since Socure is a configured partner, each of the 7 gets auto-created rather
+    // than terminating as "no-match" (see the dedicated deal-auto-creation tests
+    // below for coverage of that behavior itself) -- deal creation happens in
+    // Phase 2, which is unaffected by Phase 1's search-batching, so this still
+    // isolates Phase 1's batching timing cleanly.
     assert.strictEqual(output.results.length, 7);
     assert.strictEqual(output.companiesProcessed, 7);
-    assert.strictEqual(output.companiesNoMatch, 7);
+    assert.strictEqual(output.companiesCreated, 7);
+    assert.strictEqual(output.companiesNoMatch, 0);
 
     assert.strictEqual(delayCalls.length, 2, "3 batches (of 3, 3, 1) means exactly 2 between-batch delays");
     assert.deepStrictEqual(
@@ -490,6 +546,117 @@ async function main() {
     assert.deepStrictEqual(Array.from(waveSizes), [3, 3, 1], "searches should batch into groups of [3, 3, 1], not fire all at once or one at a time");
 
     console.log("PASS: 7 companies throttle into 3 batches of [3, 3, 1] with a 1000ms delay between each");
+  }
+
+  // ---- Deal auto-creation (added 2026-09-01) ---------------------------------
+
+  // No existing deal -> a new one is created with the correct pipeline, stage,
+  // associations, and child_deals value. Asserts directly against the CREATE call's
+  // request body (via createLog), not just the result summary, so this is a real
+  // regression guard on the exact payload shape, not just the outcome.
+  {
+    const companies = [company("Brand New Prospect Co")];
+    const { output, createLog } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(output.companiesCreated, 1);
+    assert.strictEqual(output.results[0].status, "created");
+    assert.strictEqual(output.results[0].dealId, "new-deal-1");
+
+    assert.strictEqual(createLog.length, 1, "exactly one deal CREATE call should have been made");
+    const { properties, associations } = createLog[0];
+    assert.strictEqual(properties.dealname, "Socure - Brand New Prospect Co");
+    assert.strictEqual(properties.pipeline, "t_e4c9b7838c44cc90860044f6edcb2934", "must be the real Partner Deal Lifecycle pipeline ID, resolved via GET /crm/v3/pipelines/deals, not hardcoded/guessed");
+    assert.strictEqual(properties.dealstage, "1181884181", "must be the 'Partner Lead Registration' stage ID specifically, not just the first stage by position");
+    assert.strictEqual(properties.child_deals, "true", "the real property is 'child_deals' (plural) with value the string 'true', not 'child_deal'/'Yes'");
+
+    const partnerAssoc = associations.find((a) => a.to.id === "16736354190"); // Socure's HubSpot Company ID
+    assert.ok(partnerAssoc, "the Partner company (Socure) should be associated");
+    assert.strictEqual(partnerAssoc.types[0].associationTypeId, 88, "must use the real 'Partner' association typeId (88)");
+
+    console.log("PASS: a company with no existing deal gets one auto-created with the correct pipeline, stage, and child_deals value");
+  }
+
+  // The new deal is associated to the RIGHT partner's Program-equivalent deal in the
+  // Channel Partners pipeline — tested with a different partner (ZoomInfo, not
+  // Socure) specifically to prove the correct per-partner ID is selected, not just
+  // whichever one happens to be used elsewhere in this test file.
+  {
+    const companies = [company("Another New Prospect")];
+    const { createLog } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "ZoomInfo",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(createLog.length, 1);
+    const { associations } = createLog[0];
+
+    const parentDealAssoc = associations.find((a) => a.types[0].associationTypeId === 84);
+    assert.ok(parentDealAssoc, "the new deal should carry a 'Parent Deal' (typeId 84) association");
+    assert.strictEqual(
+      parentDealAssoc.to.id,
+      "22678525001",
+      "must point at ZoomInfo's actual Program-equivalent deal ('ZoomInfo - Strategic Partnership'), not Socure's or any other partner's"
+    );
+
+    const partnerCompanyAssoc = associations.find((a) => a.types[0].associationTypeId === 88);
+    assert.strictEqual(partnerCompanyAssoc.to.id, "18325500821", "must associate ZoomInfo's own Company record, not Socure's");
+
+    console.log("PASS: the new deal is linked to the correct partner's Program-equivalent deal in the Channel Partners pipeline, not a hardcoded/wrong one");
+  }
+
+  // "created" (new deal) is a distinct status from "written" (existing deal that got
+  // matched) within the SAME call, alongside its End User company association
+  // resolving successfully (the mock roster includes "Fluz" as an existing Company).
+  {
+    const companies = [company("PayMeadow"), company("Fluz")]; // PayMeadow matches an existing deal; Fluz has no deal but IS a known company
+    const { output, createLog } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "Socure",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(output.companiesMatched, 1);
+    assert.strictEqual(output.companiesCreated, 1);
+
+    const [r1, r2] = output.results;
+    assert.strictEqual(r1.status, "written", "PayMeadow matched an existing deal");
+    assert.strictEqual(r2.status, "created", "Fluz had no existing deal, so a new one was created -- distinct status from 'written'");
+    assert.notStrictEqual(r1.status, r2.status);
+
+    const endUserAssoc = createLog[0].associations.find((a) => a.types[0].associationTypeId === 90);
+    assert.ok(endUserAssoc, "Fluz exists as a Company record in the mock roster, so the End User association should be set");
+    assert.strictEqual(endUserAssoc.to.id, "co-1");
+    assert.strictEqual(r2.reason, null, "no data-quality note expected when the End User company resolves cleanly and sentiment is recognized");
+
+    console.log("PASS: 'created' and 'written' are distinct statuses within the same call, and a resolvable End User company gets associated");
+  }
+
+  // A partner not yet configured in PARTNER_COMPANY_IDS/PARTNER_PROGRAM_DEAL_IDS
+  // falls back to the original "no-match" behavior instead of creating a deal with a
+  // missing/guessed association -- and makes no deal-create call at all.
+  {
+    const companies = [company("Some Company")];
+    const { output, createLog } = await runStep({
+      companiesJson: JSON.stringify(companies),
+      partner: "NotYetConfiguredPartner",
+      startTime: "2026-08-28T10:00:00Z"
+    });
+
+    assert.strictEqual(output.companiesCreated, 0);
+    assert.strictEqual(output.companiesNoMatch, 1);
+    assert.strictEqual(output.results[0].status, "no-match");
+    assert.ok(
+      output.results[0].reason.includes("deal auto-creation skipped") && output.results[0].reason.includes("NotYetConfiguredPartner"),
+      "reason should explain why auto-creation was skipped, naming the unconfigured partner"
+    );
+    assert.strictEqual(createLog.length, 0, "an unconfigured partner should never reach the deal-create call");
+
+    console.log("PASS: an unconfigured partner falls back to 'no-match' cleanly, without attempting deal creation");
   }
 
   console.log("\nAll tests passed.");
