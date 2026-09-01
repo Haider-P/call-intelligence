@@ -2,23 +2,28 @@
 
 ## Current Status (2026-08-29)
 
-**Fully built and wired in Zapier.** All 9 core pipeline steps are live in the Zap
+**Fully built and wired in Zapier.** All 10 core pipeline steps are live in the Zap
 builder:
 
 1. Schedule by Zapier (hourly trigger)
 2. Code by Zapier — Filter (`01-filter-partner-calls.js`)
-3. Looping by Zapier — the one outer loop, over `candidateCalls`
-4. Storage by Zapier → Get Value — dedup check (Step A below)
-5. Filter by Zapier — only continue if not already processed (Step B below)
-6. Code by Zapier — Transcript (`02-fetch-transcript.js`, Step C below)
-7. Code by Zapier — Enrichment (`03-claude-enrichment.js`, Step D below)
-8. Code by Zapier — Match + Write (`04-match-and-write-companies.js`, Step E below)
-9. Storage by Zapier → Set Value — dedup mark (Step G below)
+3. Filter by Zapier (**NEW, added 2026-09-01**) — only continue if `candidateCalls`
+   is non-empty; stops the run cleanly instead of the next step (Looping by Zapier)
+   erroring on a missing "Values to Loop" field. See "Recently fixed" below.
+4. Looping by Zapier — the one outer loop, over `candidateCalls` (unchanged since
+   before 2026-09-01 — only its position in this list shifted, to make room for the
+   new Step 3)
+5. Storage by Zapier → Get Value — dedup check (Step A below)
+6. Filter by Zapier — only continue if not already processed (Step B below)
+7. Code by Zapier — Transcript (`02-fetch-transcript.js`, Step C below)
+8. Code by Zapier — Enrichment (`03-claude-enrichment.js`, Step D below)
+9. Code by Zapier — Match + Write (`04-match-and-write-companies.js`, Step E below)
+10. Storage by Zapier → Set Value — dedup mark (Step G below)
 
 **Validated end-to-end against real production data.** Run live against the
 2026-08-26/27 Socure/Markaaz Partnership call, including a full dedup round-trip
 proof — the same call was correctly detected as already-processed on a second check,
-confirming steps 4, 5, and 9 above work together as designed in the live Zap, not
+confirming steps 5, 6, and 10 above work together as designed in the live Zap, not
 just individually.
 
 **Status: DRAFT, not published — as of 2026-08-29.** This is a deliberate pause for a
@@ -29,6 +34,22 @@ sentiment-casing fix, and the company-name matching aliases/root-causes) has bee
 applied to the source, re-validated, and is already live in the Zap's Code steps.
 Publishing from here is a go/no-go judgment call for the pipeline owner, not a
 blocked technical task.
+
+### Recently fixed
+
+- **2026-09-01 — empty-`candidateCalls` run crashed the Zap.** An hourly poll that
+  found 0 partner-matched calls (empty `candidateCalls` array from Step 2) made
+  Looping by Zapier (then Step 3, now Step 4) fail with `Required field 'Values to
+  Loop' (loop_values) is missing` — Zapier's line-item loop can't resolve an empty
+  array reference. **Root cause:** nothing gated the loop on `candidateCalls` actually
+  having entries; every prior test run happened to have at least one matching call, so
+  this was never exercised until a real hourly poll came up empty in production.
+  **Fix:** added a new Filter by Zapier step (`candidateCalls` **Exists**) between the
+  Filter Code step and the Looping step — see the new Step 3 above and in "Zap 1 —
+  Trigger + Filter" below. **Confirmed via Replay** against the failing run
+  (2026-09-01, 3:15pm): the new filter step showed "This filter successfully stopped
+  your run" and the Looping step showed "Did not attempt to send new Loop" — the fix
+  stops the run cleanly at the filter instead of the loop erroring out.
 
 ### Known minor gaps (not blockers)
 
@@ -44,7 +65,7 @@ blocked technical task.
   make the evidence trail more precise if ever revisited.
 - **The Digest by Zapier reporting layer (Zap 2, plus the optional unlisted-partner
   flag branch documented below) was not part of today's confirmed build/test scope.**
-  The core 9-step pipeline above (trigger through dedup mark) is what's been
+  The core 10-step pipeline above (trigger through dedup mark) is what's been
   validated end-to-end. Confirm Zap 2 is actually wired and firing on a schedule
   before relying on it for the run report.
 
@@ -141,8 +162,10 @@ either.
 |---|---|---|
 | 1 | **Schedule by Zapier** | Trigger: Every Hour |
 | 2 | **Code by Zapier** → Run Javascript | Paste `01-filter-partner-calls.js`. inputData: none. Environment Variables: `APOLLO_API_KEY`. |
+| 3 | **Filter by Zapier** (NEW, added 2026-09-01) | Condition: **"Candidate Calls Partner" Exists** (the field Zapier's picker shows for Step 2's `candidateCalls` array). Stops the run cleanly when `candidateCalls` comes back empty (e.g. an hourly poll with 0 partner-matched calls) — without this, an empty `candidateCalls` array makes the next step, Looping by Zapier, error out with a missing "Values to Loop" field instead of just ending the run with nothing to do. See the Troubleshooting entry below and "Recently fixed" above for the incident this fixed. |
 
-Step 2 outputs `candidateCalls` (array) and `unlistedPartnerFlags` (array).
+Step 2 outputs `candidateCalls` (array) and `unlistedPartnerFlags` (array). Step 3 gates
+on `candidateCalls` being non-empty before the run reaches the outer loop.
 
 ### Unlisted-partner flag branch (optional but recommended)
 - **Looping by Zapier** → loop over Step 2's `unlistedPartnerFlags`
@@ -153,13 +176,19 @@ Step 2 outputs `candidateCalls` (array) and `unlistedPartnerFlags` (array).
 
 ## The one outer loop — one iteration per matching call
 
-- **Looping by Zapier** → loop over Step 2's `candidateCalls`. Values to loop:
-  `conversationId`, `partner`, `topic`, `startTime`.
+- **Looping by Zapier** (Step 4) → Create Loop From Line Items, looping over Step 2's
+  `candidateCalls`. Values to loop: `conversationId`, `partner`, `topic`, `startTime`.
+  Runs only when Step 3's filter has passed (i.e. `candidateCalls` is non-empty). This
+  is otherwise unchanged from before 2026-09-01 — only its position in the overall
+  numbering shifted, to make room for the new Step 3 filter.
 
 This is the **only** "Looping by Zapier" step in the whole Zap — see "Why only one
 native loop" above before adding anything that looks like a second one.
 
-Inside this loop, in order:
+Inside this loop, in order (lettered Steps A–G below are unchanged since before
+2026-09-01 — only the new Step 3 filter and the resulting shift in the overview
+numbering above are new; see "Current Status" at the top of this doc for how these
+letters map onto the full numbered step list):
 
 | Step | App / Type | Config |
 |---|---|---|
@@ -390,3 +419,4 @@ Digest by Zapier needs a separate scheduled release. Set this up as its own tiny
 | Step E throws `"inputData.companiesJson could not be parsed as JSON"` | `companiesJson` is present but isn't valid JSON — most likely something other than Step D's `companiesJson` output got mapped there (e.g. `topic` or `transcriptText`). Check the field mapping. |
 | Same call processed twice | Confirm Step G (Storage Set Value) is actually wired after Step E, and Step A/B (Storage Get + Filter) are wired before Step C in every run |
 | Someone added a second "Looping by Zapier" step and the Zap won't turn on | This is expected — Zapier enforces "no more than one Looping by Zapier step per Zap." Remove the second loop; the per-company fan-out belongs inside `04-match-and-write-companies.js`'s plain-JS `for...of` loop, not a second native loop. See "Why only one native loop" above. |
+| Looping by Zapier step errors with "Required field 'Values to Loop' (loop_values) is missing" | This happens when candidateCalls comes back empty (e.g. an hourly poll with 0 partner-matched calls) — Zapier's line-item loop can't resolve an empty array reference. Fixed 2026-09-01 by adding a Filter by Zapier step (checking candidateCalls Exists) between the filter Code step and the Looping step. If this error reappears, confirm that filter step is still present and still ordered before the loop. |
