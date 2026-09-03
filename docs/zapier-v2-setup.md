@@ -76,6 +76,25 @@ blocked technical task.
   throwing. **The new Step 8 Filter by Zapier** (`transcriptReady` is `true`) then
   stops the run cleanly for that call — see the new Troubleshooting entry below.
 
+- **2026-09-03 — live Zap canvas had Storage → Set Value mis-positioned, silently
+  neutralizing the same-day `transcriptReady` fix above.** Confirmed the actual
+  published Zap had Storage by Zapier → Set Value (Step G, the dedup mark) wired
+  right after Step B's dedup filter — position 7 — instead of last (its documented
+  position, Step 11 / Step G, after Step E). **Effect:** every call was being marked
+  "processed" immediately after the initial not-already-processed check, before its
+  transcript was even fetched — which meant a call whose transcript wasn't ready yet
+  (the exact case the new Step 8 `transcriptReady` filter exists to catch) still got
+  marked "processed" regardless, and was never picked up on a later poll. The new
+  Step 8 filter itself worked correctly and stopped those runs cleanly, but stopping
+  a run after the call was already marked processed has the same practical outcome as
+  not stopping it at all — the call is silently dropped instead of retried. **No code
+  was wrong** — `02-fetch-transcript.js` and the doc's own step order were already
+  correct; this was purely a live Zap canvas ordering bug, caught by comparing the
+  actual published Zap against the doc's already-correct step order, not by any test
+  or code review. **Fix:** reordered Storage → Set Value to the final step in the live
+  Zap, matching the doc. No further action needed — flagging here for the incident
+  record only.
+
 ### Known minor gaps (not blockers)
 
 - **`startTime` is not yet wired all the way through the chain end-to-end.**
