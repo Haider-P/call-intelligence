@@ -1,13 +1,13 @@
 # Zapier Setup Guide — Call Intelligence v2 (Partner-Sync Pipeline)
 
-## Current Status (2026-08-29)
+## Current Status (2026-09-03)
 
-**Fully built and wired in Zapier.** All 10 core pipeline steps are live in the Zap
+**Fully built and wired in Zapier.** All 11 core pipeline steps are live in the Zap
 builder:
 
 1. Schedule by Zapier (hourly trigger)
 2. Code by Zapier — Filter (`01-filter-partner-calls.js`)
-3. Filter by Zapier (**NEW, added 2026-09-01**) — only continue if `candidateCalls`
+3. Filter by Zapier (**added 2026-09-01**) — only continue if `candidateCalls`
    is non-empty; stops the run cleanly instead of the next step (Looping by Zapier)
    erroring on a missing "Values to Loop" field. See "Recently fixed" below.
 4. Looping by Zapier — the one outer loop, over `candidateCalls` (unchanged since
@@ -16,9 +16,12 @@ builder:
 5. Storage by Zapier → Get Value — dedup check (Step A below)
 6. Filter by Zapier — only continue if not already processed (Step B below)
 7. Code by Zapier — Transcript (`02-fetch-transcript.js`, Step C below)
-8. Code by Zapier — Enrichment (`03-claude-enrichment.js`, Step D below)
-9. Code by Zapier — Match + Write (`04-match-and-write-companies.js`, Step E below)
-10. Storage by Zapier → Set Value — dedup mark (Step G below)
+8. Filter by Zapier (**NEW, added 2026-09-03**) — only continue if Step C's
+   `transcriptReady` is true; stops the run cleanly for a call whose transcript Apollo
+   hasn't finished generating yet (Step C.1 below). See "Recently fixed" below.
+9. Code by Zapier — Enrichment (`03-claude-enrichment.js`, Step D below)
+10. Code by Zapier — Match + Write (`04-match-and-write-companies.js`, Step E below)
+11. Storage by Zapier → Set Value — dedup mark (Step G below)
 
 **Validated end-to-end against real production data.** Run live against the
 2026-08-26/27 Socure/Markaaz Partnership call, including a full dedup round-trip
@@ -50,6 +53,28 @@ blocked technical task.
   (2026-09-01, 3:15pm): the new filter step showed "This filter successfully stopped
   your run" and the Looping step showed "Did not attempt to send new Loop" — the fix
   stops the run cleanly at the filter instead of the loop erroring out.
+
+- **2026-09-03 — premature transcript fetch risked repeated Zap errors (race
+  condition), a second and related but distinct issue from the one above.** Apollo
+  takes roughly 30-40 minutes after a call ends to finish generating its
+  transcript/insights. Step 2 (`01-filter-partner-calls.js`) surfaces a call as a
+  candidate as soon as it's inside the `LOOKBACK_HOURS` window — that only means the
+  call *happened* recently, not that Apollo has finished processing it. Step C
+  (`02-fetch-transcript.js`) previously assumed the transcript was always ready and
+  threw `"No transcriptText in inputData"` when it wasn't, erroring the whole Zap run
+  for that call — repeated often enough, this risks Zapier auto-pausing the Zap, the
+  same failure mode as the 2026-09-01 incident above. **Root cause, same general
+  pattern as 2026-09-01 but a different specific cause:** 2026-09-01 was an
+  empty-array edge case being treated as an error; this is a premature-fetch race
+  condition (fetching before an asynchronous, several-minutes-long external process
+  finishes) — both are cases of an expected, non-error condition being treated as a
+  hard failure. **Fix:** Step C now checks the fetched conversation's `state` field —
+  confirmed against real production data (see the READINESS CHECK section of
+  `02-fetch-transcript.js`'s header comment) that `state === "insights_generated"` is
+  the one value meaning "fully processed and ready"; any other value returns
+  `{ transcriptReady: false, ..., reason: "transcript not yet generated" }` instead of
+  throwing. **The new Step 8 Filter by Zapier** (`transcriptReady` is `true`) then
+  stops the run cleanly for that call — see the new Troubleshooting entry below.
 
 ### Known minor gaps (not blockers)
 
@@ -186,15 +211,16 @@ This is the **only** "Looping by Zapier" step in the whole Zap — see "Why only
 native loop" above before adding anything that looks like a second one.
 
 Inside this loop, in order (lettered Steps A–G below are unchanged since before
-2026-09-01 — only the new Step 3 filter and the resulting shift in the overview
-numbering above are new; see "Current Status" at the top of this doc for how these
-letters map onto the full numbered step list):
+2026-09-01, with one addition — **Step C.1, new 2026-09-03** — inserted between Steps
+C and D; see "Current Status" at the top of this doc for how these letters map onto
+the full numbered step list):
 
 | Step | App / Type | Config |
 |---|---|---|
 | A | **Storage by Zapier** → Get Value | Key: the loop's `conversationId` |
 | B | **Filter by Zapier** | Only continue if Step A's value **does not exist** (i.e. this call hasn't been processed yet) |
 | C | **Code by Zapier** → Run Javascript | Paste `02-fetch-transcript.js`. inputData: `conversationId`, `partner`, `topic`, `startTime` (map from the loop item). Environment Variables: `APOLLO_API_KEY`. |
+| C.1 | **Filter by Zapier** (**NEW, added 2026-09-03**) | Condition: **`transcriptReady` (Step C's output) is `true`**. Apollo takes 30-40 minutes after a call ends to finish generating its transcript/insights — a call can reach Step C well inside that window. Step C now checks the fetched conversation's `state` and returns `transcriptReady: false` (not an error) when Apollo hasn't finished yet; this filter stops the run cleanly for that call **before Storage by Zapier → Set Value (Step G)**, so an unready call is never marked "processed" — it will be picked up and retried on a later hourly poll once Apollo finishes. See the Troubleshooting entry below and "Recently fixed" above. |
 | D | **Code by Zapier** → Run Javascript | Paste `03-claude-enrichment.js`. inputData: `transcriptText`, `partner`, `topic`, `startTime` (map from Step C). Environment Variables: `ANTHROPIC_API_KEY`. |
 | E | **Code by Zapier** → Run Javascript | Paste `04-match-and-write-companies.js`. inputData: `companiesJson` (**map Step D's "Companies Json" output field specifically — a plain string pill — NOT "Step Output {...}"**; see the callout below), `partner`, `startTime` (carry forward from the outer loop item — Zapier lets you reference fields from any earlier step in the same branch, not just the immediately preceding one). Environment Variables: `HUBSPOT_ACCESS_TOKEN`. |
 | F | **Digest by Zapier** → Add to Digest | Digest name e.g. `call-intel-run-report` (same digest as the unlisted-partner branch). Fields: `partner`, `startTime`, `companiesProcessed`, `companiesMatched`, `companiesCreated`, `companiesNoMatch`, `companiesSkippedTimeout`, `companiesErrored`, and `results` (Zapier will store the array as a single field — see note below if your digest needs it human-readable). |
@@ -431,7 +457,11 @@ Still inside the one outer loop, after Steps C–F for that call have all comple
 
 This must run after Step E has fully finished writing that call's companies — setting
 it earlier risks marking a call "processed" while its companies are still being
-written.
+written. It must also run **after Step C.1's filter has passed** (`transcriptReady`
+is `true`) — a call whose transcript wasn't ready yet was already stopped at C.1 and
+never reaches Step E or this step, so it's never marked "processed" and will be
+retried on a later poll. Do not move Step G ahead of C.1 or attempt to mark a call
+processed on the not-ready branch.
 
 ---
 
@@ -528,3 +558,4 @@ and their deal-desk notification will drift out of sync silently.
 | Same call processed twice | Confirm Step G (Storage Set Value) is actually wired after Step E, and Step A/B (Storage Get + Filter) are wired before Step C in every run |
 | Someone added a second "Looping by Zapier" step and the Zap won't turn on | This is expected — Zapier enforces "no more than one Looping by Zapier step per Zap." Remove the second loop; the per-company fan-out belongs inside `04-match-and-write-companies.js`'s plain-JS `for...of` loop, not a second native loop. See "Why only one native loop" above. |
 | Looping by Zapier step errors with "Required field 'Values to Loop' (loop_values) is missing" | This happens when candidateCalls comes back empty (e.g. an hourly poll with 0 partner-matched calls) — Zapier's line-item loop can't resolve an empty array reference. Fixed 2026-09-01 by adding a Filter by Zapier step (checking candidateCalls Exists) between the filter Code step and the Looping step. If this error reappears, confirm that filter step is still present and still ordered before the loop. |
+| Step C's Data out shows `transcriptReady: false` | Expected and not an error — Apollo hadn't finished processing the call yet (30-40 min typical lag). The new Filter step (C.1) after Step C stops this call cleanly for this run; it'll be picked up again on a later poll since it was never marked processed in Storage by Zapier. |

@@ -53,12 +53,62 @@
  * turns out to be neither, the error message names the conversation ID so it's easy
  * to spot in Zapier's run history and extend the parser.
  *
+ * READINESS CHECK — `state` field, added 2026-09-03 to fix a race condition:
+ *   Apollo takes roughly 30-40 minutes after a call ends to finish generating its
+ *   transcript/insights. Step 1 (`01-filter-partner-calls.js`) surfaces a call as a
+ *   candidate as soon as it's inside the LOOKBACK_HOURS window — that only means the
+ *   call *happened* recently, not that Apollo has finished processing it. Fetching the
+ *   transcript before it's ready must NOT throw (an earlier version of this file did,
+ *   which would error the whole Zap run — same failure-mode shape as the 2026-09-01
+ *   loop_values incident: an expected/routine "not ready yet" state being treated as
+ *   an error).
+ *
+ *   CONFIRMED READY VALUE — `state === "insights_generated"`. Confirmed multiple ways,
+ *   not guessed:
+ *     1. Live production data, pulled 2026-09-03 via an authenticated Apollo MCP
+ *        channel (apollo_conversations_search / get_transcript): every real call
+ *        outside the 30-40 min processing window — e.g. conversation
+ *        `6a988c2bb1fdd90010a86abf`, "ZoomInfo/Markaaz Patnership", 2026-09-02 —
+ *        carries `"state":"insights_generated"` as a top-level field on the SAME
+ *        conversation object that carries `transcript`, matching this file's existing
+ *        "one endpoint, one object" documentation above.
+ *     2. Apollo's own tooling documents this explicitly: the insights-retrieval tool
+ *        built on this same API states insights are "Only available once insights
+ *        have been fully processed (state=insights_generated)" — a direct, authoritative
+ *        confirmation of what "ready" means, from Apollo's side, not an inference.
+ *     3. This lines up with the 2026-08-26 header note on Step 1
+ *        (`01-filter-partner-calls.js`): real `state` values include
+ *        `"insights_generated"`, which is richer than an earlier four-value enum
+ *        assumed for this field (`created` / `downloaded` / `transcribed` / `processed`
+ *        — that four-value list is itself confirmed real: it's the exact `state` filter
+ *        enum on Apollo's own conversation-search tooling, just incomplete as a
+ *        description of every value the field can actually hold).
+ *
+ *   NOT-READY VALUES — no in-flight (pre-`insights_generated`) conversation was found
+ *   in live production data during this fix (nothing was actively processing at
+ *   verification time — consistent with the 30-40 min lag, since anything older has
+ *   already finished). Rather than guess which of the four enum values (`created` /
+ *   `downloaded` / `transcribed` / `processed`) a specific in-flight call would show,
+ *   readiness is checked by EXCLUSION: any `state` other than `"insights_generated"` —
+ *   including those four known values AND any future/unknown value — is treated as
+ *   "not ready yet," not as an error. Only a genuine fetch failure (non-OK response,
+ *   unrecognized transcript shape once state IS ready) still throws.
+ *
  * Zapier wiring:
  *   Step type: Code by Zapier → "Run Javascript"
  *   inputData (map these fields from the current loop item, via the Zapier UI):
  *     conversationId, partner, topic, startTime, apolloApiKey
- *   output: { conversationId, transcriptText, partner, topic, startTime }
+ *   output (not ready): { transcriptReady: false, conversationId, partner, topic,
+ *     startTime, reason: "transcript not yet generated" }
+ *   output (ready): { transcriptReady: true, conversationId, transcriptText, partner,
+ *     topic, startTime }
  */
+
+// The one `state` value confirmed to mean "Apollo has fully finished processing this
+// conversation" — see the READINESS CHECK section of the header comment above for how
+// this was confirmed (live production data + Apollo's own tooling documentation).
+// Any other value (known enum member or not) is treated as "not ready yet."
+const READY_STATE = "insights_generated";
 
 function segmentsToText(segments) {
   return segments
@@ -71,26 +121,7 @@ function segmentsToText(segments) {
     .join("\n");
 }
 
-async function fetchApolloConversation(apiKey, conversationId) {
-  const url = `https://api.apollo.io/api/v1/conversations/${conversationId}`;
-
-  const response = await fetch(url, {
-    method: "GET",
-    headers: {
-      "X-Api-Key": apiKey,
-      "User-Agent": "markaaz-call-intelligence/2.0",
-      "Content-Type": "application/json"
-    }
-  });
-
-  if (!response.ok) {
-    const errorText = await response.text();
-    throw new Error(`Apollo conversation fetch failed for ${conversationId}: ${response.status} — ${errorText}`);
-  }
-
-  const data = await response.json();
-  const rawTranscript = data.transcript;
-
+function extractTranscriptText(rawTranscript, conversationId) {
   // Case 1: already a plain, speaker-labeled string — use as-is.
   if (typeof rawTranscript === "string") {
     const trimmed = rawTranscript.trim();
@@ -114,6 +145,26 @@ async function fetchApolloConversation(apiKey, conversationId) {
   throw new Error(`Unrecognized transcript shape on conversation ${conversationId}`);
 }
 
+async function fetchApolloConversation(apiKey, conversationId) {
+  const url = `https://api.apollo.io/api/v1/conversations/${conversationId}`;
+
+  const response = await fetch(url, {
+    method: "GET",
+    headers: {
+      "X-Api-Key": apiKey,
+      "User-Agent": "markaaz-call-intelligence/2.0",
+      "Content-Type": "application/json"
+    }
+  });
+
+  if (!response.ok) {
+    const errorText = await response.text();
+    throw new Error(`Apollo conversation fetch failed for ${conversationId}: ${response.status} — ${errorText}`);
+  }
+
+  return response.json();
+}
+
 const apiKey = inputData.apolloApiKey;
 if (!apiKey) {
   throw new Error("apolloApiKey is missing from inputData — map it in this step's Input Data panel");
@@ -124,12 +175,29 @@ if (!conversationId) {
   throw new Error("No conversationId in inputData — check the loop item field mapping");
 }
 
-const transcriptText = await fetchApolloConversation(apiKey, conversationId);
+const conversationData = await fetchApolloConversation(apiKey, conversationId);
 
-return {
-  conversationId,
-  transcriptText,
-  partner: inputData.partner,
-  topic: inputData.topic,
-  startTime: inputData.startTime
-};
+if (conversationData.state !== READY_STATE) {
+  // Not an error — Apollo hasn't finished processing this call yet (30-40 min typical
+  // lag). Do NOT throw: let the Zap's Filter step (after this one) stop this run
+  // cleanly so the call is picked up again, still unmarked in Storage, on a later poll.
+  return {
+    transcriptReady: false,
+    conversationId,
+    partner: inputData.partner,
+    topic: inputData.topic,
+    startTime: inputData.startTime,
+    reason: "transcript not yet generated"
+  };
+} else {
+  const transcriptText = extractTranscriptText(conversationData.transcript, conversationId);
+
+  return {
+    transcriptReady: true,
+    conversationId,
+    transcriptText,
+    partner: inputData.partner,
+    topic: inputData.topic,
+    startTime: inputData.startTime
+  };
+}
